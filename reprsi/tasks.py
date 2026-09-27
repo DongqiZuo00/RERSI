@@ -1,11 +1,7 @@
-"""Exact, typed mathematical constructors from Appendix C.2.
-
-No generated code is evaluated. Answer expressions are parsed through a small AST
-whitelist before construction as SymPy objects.
-"""
 import ast
 from dataclasses import dataclass
 import json
+import math
 import re
 import sympy as sp
 
@@ -60,7 +56,7 @@ def safe_expression(text):
 
     def visit(n):
         if isinstance(n, ast.Constant) and type(n.value) in (int, float):
-            if abs(n.value) > 10**12:
+            if (type(n.value) is int and n.value.bit_length()>1024) or (type(n.value) is float and not math.isfinite(n.value)):
                 raise ValueError("Answer magnitude exceeded")
             return sp.Rational(str(n.value))
         if isinstance(n, ast.Name) and n.id == "z":
@@ -76,9 +72,25 @@ def safe_expression(text):
             if isinstance(n.op, ast.Sub): return x - y
             if isinstance(n.op, ast.Mult): return x * y
             if isinstance(n.op, ast.Div) and y != 0: return x / y
-            if isinstance(n.op, ast.Pow) and y.is_Integer and abs(int(y)) <= 16: return x**y
+            if isinstance(n.op, ast.Pow) and y.is_Integer and abs(int(y)) <= 16:
+                if x==0 and y<0:raise ValueError("Division by zero")
+                return bounded(x**y)
         raise ValueError("Unsupported answer syntax")
-    return visit(tree.body)
+    def bounded(value):
+        if isinstance(value,tuple):return tuple(bounded(v) for v in value)
+        if not isinstance(value,sp.Expr):raise ValueError("Expected an exact expression")
+        if value.has(sp.zoo,sp.oo,-sp.oo,sp.nan):raise ValueError("Non-finite expression")
+        if value.free_symbols:
+            if sp.degree(value,Z)>16:raise ValueError("Answer polynomial degree exceeded")
+            coefficients=sp.Poly(value,Z).all_coeffs()
+        else:coefficients=[value]
+        for coefficient in coefficients:
+            if not coefficient.is_Rational:raise ValueError("Expected rational polynomial coefficients")
+            if int(coefficient.p).bit_length()>4096 or int(coefficient.q).bit_length()>4096:
+                raise ValueError("Exact answer size exceeded")
+        return value
+    try:return bounded(visit(tree.body))
+    except sp.PolynomialError as exc:raise ValueError("Expected a polynomial answer") from exc
 
 
 def equivalent(x, y):
@@ -100,7 +112,7 @@ class Task:
             return 0.0
         try:
             return float(equivalent(safe_expression(answer), safe_expression(self.answer)))
-        except (ValueError, TypeError, SyntaxError, ZeroDivisionError, OverflowError, AttributeError):
+        except (ValueError, TypeError, SyntaxError, ZeroDivisionError, OverflowError, AttributeError, RecursionError):
             return 0.0
 
 

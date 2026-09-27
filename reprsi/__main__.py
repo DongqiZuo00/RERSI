@@ -1,188 +1,321 @@
-"""Command line entry points; run python -m reprsi --help."""
-from copy import deepcopy
 from pathlib import Path
 import argparse
 import json
-import random
-import time
+import importlib.metadata
 from .diagnostics import make_math_pool,read_jsonl,write_jsonl,validate_pools,sample_batch
-from .metrics import seed_for,pass_at_k
+from .metrics import seed_for
+from .storage import atomic_json,digest,file_digest,link_or_copy
 
 
-def load_config(path):
-    return json.loads(Path(path).read_text())
+def load_config(path):return json.loads(Path(path).read_text())
 
 
 def make_policy(cfg):
     from .policy import Policy,seed_all
     seed_all(cfg["seed"])
+    if cfg.get("backend")=="tiny":
+        from .smoke import TinyPolicy
+        return TinyPolicy(cfg)
     return Policy(cfg)
 
 
 def make_domain(args,cfg):
-    if cfg.get("domain","math")=="manufactoria":
+    domain=cfg.get("domain","math")
+    if domain=="manufactoria":
         from .manufactoria import Domain
-        if not args.delta_root: raise ValueError("--delta-root is required")
+        if not args.delta_root:raise ValueError("--delta-root is required")
         return Domain(args.delta_root)
+    if domain=="twohop":
+        from .mechanism import TwoHopDomain
+        if not args.twohop_data:raise ValueError("--twohop-data is required")
+        return TwoHopDomain(args.twohop_data)
+    if domain!="math":raise ValueError("Unknown domain")
     return None
 
 
+def load_tasks(path,args,cfg,domain=None,training=False,allow_empty=False):
+    from .benchmarks import validate_targets
+    rows=read_jsonl(path)
+    if cfg.get("domain")=="twohop":
+        from .mechanism import load_entities
+        if training and any(r.get("split")!="train" for r in rows):raise ValueError("Target training split required")
+        tasks=load_entities(rows)
+    elif domain:
+        if training and any(r.get("split")!="train" for r in rows):raise ValueError("Target training split required")
+        tasks=domain.load_released_tasks(rows)
+    else:
+        from .benchmarks import load_targets,HARPChecker
+        tasks=load_targets(path,HARPChecker(args.harp_root),"train" if training else None,training,
+                           cfg["model"] if training else None,cfg["revision"] if training else None,allow_empty)
+    if not tasks and not allow_empty:raise ValueError("Empty task set")
+    if len({t.identity for t in tasks})!=len(tasks):raise ValueError("Duplicate task identity")
+    if not training and len({r.get("split") for r in rows})>1:raise ValueError("Mixed partitions")
+    return rows,tasks
+
+
+def common(sub,name):
+    p=sub.add_parser(name);p.add_argument("--config",default="configs/math.json");p.add_argument("--output",required=True)
+    p.add_argument("--delta-root");p.add_argument("--harp-root");p.add_argument("--twohop-data")
+    p.add_argument("--seed",type=int);p.add_argument("--resume",action="store_true")
+    return p
+
+
 def main():
-    parser=argparse.ArgumentParser(description="Minimal RepRSI core implementation")
+    parser=argparse.ArgumentParser(description="RepRSI workflows")
     sub=parser.add_subparsers(dest="command",required=True)
-    p=sub.add_parser("smoke",help="Real tiny Transformer/RLOO integration check on CPU")
-    p.add_argument("--output",default="runs/smoke")
-    p=sub.add_parser("prepare-diagnostics")
-    p.add_argument("--output",default="data/diagnostics")
-    p.add_argument("--domain",choices=["math","manufactoria"],default="math")
-    p.add_argument("--seed",type=int,default=2026)
-    p=sub.add_parser("prepare-math");p.add_argument("--source",required=True);p.add_argument("--output",default="data/math")
-    p=sub.add_parser("prepare-harp");p.add_argument("--source",required=True);p.add_argument("--output",default="data/harp")
-    for command in ["train","calibration-trajectory","calibrate","evaluate","screen"]:
-        p=sub.add_parser(command)
-        p.add_argument("--config",default="configs/math.json")
-        p.add_argument("--output",required=True)
-        p.add_argument("--delta-root")
-        if command=="train":
-            p.add_argument("--diagnostics",required=True);p.add_argument("--calibration",required=True)
-            p.add_argument("--target-train");p.add_argument("--harp-root");p.add_argument("--seed",type=int)
-            p.add_argument("--preparation-costs",nargs="*",default=[])
-        elif command=="calibration-trajectory":
-            p.add_argument("--batches",type=int,default=2)
-        elif command=="calibrate":
-            p.add_argument("--diagnostics",required=True)
-            p.add_argument("--checkpoints",nargs="+",required=True)
-            p.add_argument("--layers",nargs="+",type=int)
-            p.add_argument("--specs-per-family",type=int,default=1)
-        else:
-            p.add_argument("--data",required=True);p.add_argument("--checkpoint");p.add_argument("--harp-root")
-            p.add_argument("--samples",type=int,default=32)
-            p.add_argument("--greedy",action="store_true")
+    p=sub.add_parser("smoke");p.add_argument("--output",default="runs/smoke");p.add_argument("--resume",action="store_true")
+    p=sub.add_parser("prepare-diagnostics");p.add_argument("--output",default="data/diagnostics")
+    p.add_argument("--domain",choices=["math","manufactoria"],default="math");p.add_argument("--seed",type=int,default=2026)
+    for command in ("prepare-math","prepare-harp"):
+        p=sub.add_parser(command);p.add_argument("--source",required=True);p.add_argument("--output",required=True)
+    p=sub.add_parser("prepare-manufactoria");p.add_argument("--source",required=True);p.add_argument("--output",required=True)
+    p.add_argument("--delta-root",required=True);p.add_argument("--split",choices=["train","dev","test"],required=True)
+    p.add_argument("--family",choices=["START","APPEND","EXACT","REGEX","COMPR","HAS"],required=True)
+    p=sub.add_parser("prepare-twohop");p.add_argument("--output",required=True)
+    p=sub.add_parser("aggregate");p.add_argument("--inputs",nargs="+",required=True);p.add_argument("--baseline",nargs="+");p.add_argument("--output",required=True)
+    p=sub.add_parser("analyze-prediction");p.add_argument("--data",required=True);p.add_argument("--likelihood",action="store_true");p.add_argument("--output",required=True)
+    p=sub.add_parser("summarize-fresh");p.add_argument("--runs",nargs="+",required=True);p.add_argument("--plot",action="store_true");p.add_argument("--output",required=True)
+    p=sub.add_parser("doctor");p.add_argument("--config",default="configs/math.json");p.add_argument("--output")
+    p=common(sub,"train");p.add_argument("--diagnostics",required=True);p.add_argument("--calibration",required=True)
+    p.add_argument("--monitor");p.add_argument("--target-train");p.add_argument("--eval-data");p.add_argument("--budget-from")
+    p.add_argument("--method",choices=["reprsi","matched-search","target","uncertainty","shuffled","prompted","direct","human"])
+    p.add_argument("--rounds",type=int);p.add_argument("--preparation-costs",nargs="*",default=[])
+    p=common(sub,"calibration-trajectory");p.add_argument("--batches",type=int,default=2);p.add_argument("--initial")
+    p=common(sub,"calibrate");p.add_argument("--diagnostics",required=True);p.add_argument("--checkpoints",nargs="+",required=True)
+    p.add_argument("--layers",nargs="+",type=int);p.add_argument("--specs-per-family",type=int,default=1)
+    p.add_argument("--initial")
+    for command in ("evaluate","screen"):
+        p=common(sub,command);p.add_argument("--data",required=True);p.add_argument("--checkpoint");p.add_argument("--samples",type=int,default=32)
+        p.add_argument("--greedy",action="store_true");p.add_argument("--save-responses",action="store_true");p.add_argument("--initial")
+        p.add_argument("--method");p.add_argument("--allow-legacy-checkpoint",action="store_true")
+    p=common(sub,"export-curricula");p.add_argument("--checkpoint",required=True);p.add_argument("--count",type=int,default=32)
+    p.add_argument("--sampling-seed",type=int,default=2027)
+    p=common(sub,"export-reference");p.add_argument("--method",choices=["direct","human"],required=True)
+    p.add_argument("--count",type=int,default=1024);p.add_argument("--target-train");p.add_argument("--sampling-seed",type=int,default=2027)
+    p=common(sub,"fresh-student");p.add_argument("--curricula",required=True);p.add_argument("--initial")
+    p.add_argument("--steps",type=int,default=800);p.add_argument("--eval-every",type=int,default=40);p.add_argument("--eval-data")
+    p.add_argument("--teacher-id");p.add_argument("--supervised",action="store_true")
+    p=common(sub,"intervene");p.add_argument("--initial",required=True);p.add_argument("--layer",type=int,required=True)
+    p.add_argument("--seeds",nargs="+",type=int,default=list(range(5)));p.add_argument("--steps",type=int,default=500)
+    p.add_argument("--continuation-steps",type=int,default=400)
+    p=common(sub,"prediction-trials");p.add_argument("--groups",required=True);p.add_argument("--initial",required=True)
+    p.add_argument("--layer",type=int,required=True);p.add_argument("--trials",type=int,default=5)
+    p.add_argument("--curriculum-steps",type=int,default=150);p.add_argument("--continuation-steps",type=int,default=400)
+    p=common(sub,"prediction-origins");p.add_argument("--initial",required=True);p.add_argument("--runs",type=int,default=200)
+    p.add_argument("--steps",type=int,default=400)
+    p=common(sub,"prediction-groups");p.add_argument("--origins",required=True);p.add_argument("--groups-per-run",type=int,default=10)
+    p.add_argument("--items",type=int,default=100)
     args=parser.parse_args()
     if args.command=="smoke":
         from .smoke import TinyPolicy,smoke_config
         from .loop import run
-        cfg=smoke_config();pool=make_math_pool("reward",1)
-        run(cfg,TinyPolicy(cfg),pool,args.output,layer=0)
-        return
+        cfg=smoke_config();print(run(cfg,TinyPolicy(cfg),make_math_pool("reward",1),args.output,0,resume=args.resume));return
     if args.command=="prepare-diagnostics":
-        maker=make_math_pool
-        counts=[64,16,4]
+        maker=make_math_pool;counts=[64,16,4]
         if args.domain=="manufactoria":
             from .manufactoria import make_dfa_pool
             maker=make_dfa_pool;counts=[128,32,8]
         pools=[maker(split,count,args.seed) for split,count in zip(["reward","monitor","calibration"],counts)]
         validate_pools(pools)
-        for split,pool in zip(["reward","monitor","calibration"],pools):
-            write_jsonl(Path(args.output)/(split+".jsonl"),pool)
+        for split,pool in zip(["reward","monitor","calibration"],pools):write_jsonl(Path(args.output)/(split+".jsonl"),pool)
+        atomic_json(Path(args.output)/"manifest.json",{"domain":args.domain,"seed":args.seed,"counts":list(map(len,pools)),"digests":list(map(digest,pools))})
         print({"counts":list(map(len,pools)),"domain":args.domain});return
-    if args.command in {"prepare-math","prepare-harp"}:
+    if args.command in ("prepare-math","prepare-harp"):
         from .benchmarks import prepare_math,prepare_harp
         (prepare_math if args.command=="prepare-math" else prepare_harp)(args.source,args.output);return
+    if args.command=="prepare-manufactoria":
+        from .manufactoria import Domain,FAMILIES
+        domain=Domain(args.delta_root);records=read_jsonl(args.source);tasks=domain.load_released_tasks(records)
+        for row in records:
+            family=row.get("problem_family") or row.get("problem_type") or row.get("pattern_type") or row.get("family")
+            if family not in (args.family,FAMILIES[args.family]):raise ValueError("Released family metadata does not match --family")
+        from .curricula import task_record
+        rows=[{**task_record(t),"split":args.split,"benchmark":"Manufactoria-"+args.family,"family":args.family} for t in tasks]
+        if len({r["id"] for r in rows})!=len(rows):raise ValueError("Duplicate released Manufactoria identity")
+        write_jsonl(args.output,rows);print({"examples":len(rows)});return
+    if args.command=="prepare-twohop":
+        from .mechanism import prepare_twohop,exposure_report
+        print(prepare_twohop(args.output));print(exposure_report(args.output));return
+    if args.command in ("aggregate","analyze-prediction","summarize-fresh"):
+        from .analysis import aggregate,prediction_analysis,fresh_curves,plot_fresh
+        if args.command=="aggregate":report=aggregate([load_config(x) for x in args.inputs],[load_config(x) for x in args.baseline] if args.baseline else None)
+        elif args.command=="analyze-prediction":report=prediction_analysis(read_jsonl(args.data),args.likelihood)
+        else:report=fresh_curves(args.runs)
+        atomic_json(args.output,report)
+        if args.command=="summarize-fresh" and args.plot:plot_fresh(report,Path(args.output).with_suffix(".pdf"))
+        print(report);return
     cfg=load_config(args.config)
-    if args.command=="train" and args.seed is not None: cfg["seed"]=args.seed
+    if args.command=="doctor":
+        import torch,shutil
+        report={"python_libraries":{},"cuda_available":torch.cuda.is_available(),"cuda_devices":[torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())],
+                "model":cfg["model"],"revision":cfg["revision"],"disk_free_bytes":shutil.disk_usage(Path.cwd()).free}
+        for name in ("torch","transformers","numpy","sympy","lm-format-enforcer","automata-lib"):
+            try:report["python_libraries"][name]=importlib.metadata.version(name)
+            except importlib.metadata.PackageNotFoundError:report["python_libraries"][name]="not installed"
+        if args.output:atomic_json(args.output,report)
+        print(json.dumps(report,indent=2));return
+    if args.seed is not None:cfg["seed"]=args.seed
+    if args.command=="screen" and (args.checkpoint or args.initial):raise ValueError("Screening must use the initial instruction-tuned model")
+    if args.command=="train":
+        if args.method:cfg["method"]=args.method
+        if args.rounds:cfg["rounds"]=args.rounds
+        if args.budget_from:
+            reference=load_config(args.budget_from)
+            if any(reference[k]!=cfg[k] for k in ("model","revision","seed")):raise ValueError("Reference budget belongs to a different backbone/seed")
+            if reference["method"]!="reprsi" or reference["completed_rounds"]!=100:raise ValueError("Matched budget requires a complete 100-round RepRSI reference")
+            cfg["max_gpu_seconds"]=reference["gpu_seconds"]
+            cfg["rounds"]=args.rounds or 100000
     domain=make_domain(args,cfg)
+    if args.command=="export-reference":
+        from .curricula import human_curriculum,task_record
+        import numpy as np
+        from .policy import seed_all
+        if args.count<3:raise ValueError("Reference set needs at least three examples")
+        seed_all(args.sampling_seed);rows=[]
+        if args.method=="direct":
+            if not args.target_train:raise ValueError("Direct reference requires --target-train")
+            _,tasks=load_tasks(args.target_train,args,cfg,domain,True)
+            rng=np.random.default_rng(args.sampling_seed)
+            tasks=[tasks[int(i)] for i in rng.choice(len(tasks),args.count,replace=len(tasks)<args.count)]
+            for task in tasks:
+                row=task_record(task)
+                if domain is None:row["kind"]="benchmark_math"
+                rows.append(row)
+        else:
+            for stage,indices in enumerate(np.array_split(np.arange(args.count),3)):
+                tasks=human_curriculum(len(indices),seed_for(args.sampling_seed,"human",stage),stage,domain)
+                rows.extend({**task_record(t),"stage":stage} for t in tasks)
+        write_jsonl(args.output,rows);print({"examples":len(rows),"method":args.method});return
     policy=make_policy(cfg)
     if args.command=="train":
         from .loop import run
         calibration=load_config(args.calibration)
-        if calibration["model"]!=cfg["model"] or calibration["revision"]!=cfg["revision"]:
-            raise ValueError("Calibration backbone does not match training backbone")
-        if calibration["domain"]!=cfg["domain"]: raise ValueError("Calibration domain mismatch")
+        if any(calibration[k]!=cfg[k] for k in ("model","revision","domain")):raise ValueError("Calibration backbone/domain mismatch")
         cfg["preparation_gpu_seconds"]=calibration["calibration_gpu_seconds"]
-        for cost_file in args.preparation_costs:
-            cost=load_config(cost_file)
-            if cost["cost_role"]!="shared_training_preparation":raise ValueError("Only training/development screening is charged to training")
+        seen=set()
+        for filename in args.preparation_costs:
+            sha=file_digest(filename)
+            if sha in seen:raise ValueError("Duplicate preparation charge")
+            seen.add(sha);cost=load_config(filename)
+            if cost["cost_role"]!="shared_training_preparation":raise ValueError("Only TRAIN/DEV screening is charged to training")
+            if any(cost[k]!=cfg[k] for k in ("model","revision")):raise ValueError("Preparation backbone mismatch")
             cfg["preparation_gpu_seconds"]+=cost["gpu_seconds"]
-        reward=read_jsonl(args.diagnostics)
-        if {r["id"] for r in reward}&set(calibration["diagnostic_ids"]): raise ValueError("Calibration/reward overlap")
-        targets=None
-        if args.target_train:
-            from .benchmarks import load_targets,HARPChecker
-            targets=load_targets(args.target_train,HARPChecker(args.harp_root),"train",True)
-        run(cfg,policy,reward,args.output,calibration["layer"],domain,targets)
-        return
+        reward=read_jsonl(args.diagnostics);monitor=read_jsonl(args.monitor) if args.monitor else None
+        for pool in (reward,monitor or []):
+            if {r["id"] for r in pool}&set(calibration["diagnostic_ids"]):raise ValueError("Calibration overlaps training/monitoring")
+            if {digest(r["prompt"]) for r in pool}&set(calibration.get("diagnostic_prompt_hashes",[])):raise ValueError("Calibration prompt overlap")
+        targets=load_tasks(args.target_train,args,cfg,domain,True)[1] if args.target_train else None
+        eval_tasks=None
+        if args.eval_data:
+            rows,eval_tasks=load_tasks(args.eval_data,args,cfg,domain)
+            if any(r.get("split") not in ("test","dev") for r in rows):raise ValueError("Periodic evaluation requires held-out records")
+        if args.budget_from:
+            from .loop import hardware_signature
+            if reference["gpu_count"]!=policy.gpu_count:raise ValueError("Matched GPU count differs")
+            if reference.get("hardware")!=hardware_signature(policy):raise ValueError("Matched hardware/precision differs")
+            if reference["preparation_gpu_seconds"]!=cfg["preparation_gpu_seconds"]:raise ValueError("Shared preparation costs differ")
+        print(run(cfg,policy,reward,args.output,calibration["layer"],domain,targets,args.resume,monitor,eval_tasks));return
     if args.command=="calibration-trajectory":
-        from .loop import Ledger
-        from .schema import EXAMPLES
+        from .curricula import math_items
         from .tasks import construct
+        from .experiments import train_fixed
         from .policy import seed_all
-        output=Path(args.output);output.mkdir(parents=True,exist_ok=True)
-        ledger=Ledger(policy,output/"compute.jsonl")
-        with ledger.charge("calibration_checkpoint_save"): policy.save(output/"step_000.pt")
+        initial_id="pretrained"
+        if args.initial:
+            policy.load(args.initial);initial_id=file_digest(args.initial);policy.set_reference(initial_id)
+        tasks=[]
         for batch in range(args.batches):
             seed=seed_for(2026,"independent_calibration_training",batch);seed_all(seed)
-            if domain:
-                tasks=domain.fixed_calibration_curriculum(cfg["items"],seed)
-            else:
-                rng=random.Random(seed);tasks=[]
-                for i in range(cfg["items"]):
-                    item=deepcopy(EXAMPLES[i%4])
-                    if i%4==0: item["parameters"]["a"]=[rng.randint(-20,20),rng.randint(1,20)]
-                    elif i%4==1: item["parameters"]["a"]["poly"]=[rng.randint(-9,9) for _ in range(5)]
-                    elif i%4==2: item["parameters"]["a"]=rng.randint(-20,20)
-                    else:
-                        item["parameters"]["a"]["matrix"]=[[1,0,rng.randint(-9,9)],[0,1,rng.randint(-9,9)]]
-                    tasks.append(construct(item))
-            with ledger.charge("calibration_training",batch):
-                policy.train_curriculum(tasks,seed)
-                policy.save(output/f"step_{(batch+1)*cfg['student_steps']:03d}.pt")
-        return
+            current=domain.fixed_calibration_curriculum(cfg["items"],seed) if domain else [construct(x) for x in math_items(cfg["items"],seed,batch%3)]
+            tasks.extend(current*2)
+        cfg["seed"]=2026
+        report=train_fixed(policy,cfg,tasks,args.output,args.batches*cfg["student_steps"],cfg["student_steps"],resume=args.resume,initial_id=initial_id)
+        output=Path(args.output);link_or_copy(output/"initial.pt",output/"step_000.pt")
+        for step in range(cfg["student_steps"],args.batches*cfg["student_steps"]+1,cfg["student_steps"]):
+            link_or_copy(output/"states"/f"step_{step:06d}"/"student.pt",output/f"step_{step:03d}.pt")
+        print(report);return
     if args.command=="calibrate":
         from .calibrate import select_layer
         from .loop import Ledger
-        pool=read_jsonl(args.diagnostics)
+        if args.initial:
+            policy.load(args.initial);policy.set_reference(file_digest(args.initial))
+        pool=read_jsonl(args.diagnostics);validate_pools([pool])
         batch=sample_batch(pool,args.specs_per_family,seed_for(2026,"calibration_sample"))
         path=Path(args.output);path.parent.mkdir(parents=True,exist_ok=True)
         ledger=Ledger(policy,path.with_suffix(".compute.jsonl"))
         with ledger.charge("layer_calibration"):
-            report=select_layer(policy,batch,args.checkpoints,args.layers or range(len(policy.blocks)))
-        report.update(model=cfg["model"],revision=cfg["revision"],domain=cfg["domain"],diagnostic_ids=[r["id"] for r in batch])
-        trajectory_cost=0.0
-        for parent in {Path(checkpoint).parent for checkpoint in args.checkpoints}:
+            report=select_layer(policy,batch,args.checkpoints,args.layers or range(len(policy.blocks)),path.with_suffix(".progress.json"),args.resume)
+        trajectory_cost=0.
+        for parent in {Path(x).parent for x in args.checkpoints}:
             cost_file=parent/"compute.jsonl"
-            if not cost_file.exists():raise ValueError("Calibration checkpoints require a sibling compute.jsonl ledger")
+            if not cost_file.exists():raise ValueError("Calibration checkpoints require a sibling compute.jsonl")
             trajectory_cost+=sum(x["gpu_seconds"] for x in read_jsonl(cost_file))
-        report["calibration_gpu_seconds"]=ledger.total+trajectory_cost
-        path.write_text(json.dumps(report,indent=2)+"\n");print({"selected_layer":report["layer"]});return
-    from .policy import seed_all
-    from .benchmarks import HARPChecker,load_targets
-    records=read_jsonl(args.data)
-    if domain: tasks=domain.load_released_tasks(records)
-    else:
-        if not args.harp_root: raise ValueError("Evaluation requires --harp-root at the paper revision")
-        tasks=load_targets(args.data,HARPChecker(args.harp_root))
-    if args.checkpoint: policy.load(args.checkpoint)
-    if args.command=="screen" and args.checkpoint: raise ValueError("Screening must use the initial checkpoint")
-    n=128 if args.command=="screen" else (1 if args.greedy else args.samples)
-    outcomes=[];policy.synchronize();begin=time.perf_counter()
-    for record,task in zip(records,tasks):
-        overflow=False
-        try: policy.encode(task.prompt,16384)
-        except ValueError: overflow=True
-        successes=[]
-        for sample in range(n):
-            purpose="screening" if args.command=="screen" else "final_evaluation"
-            seed_all(seed_for(2026 if args.command=="screen" else cfg["seed"],purpose,cfg["model"],task.identity,sample))
-            value=0.0 if overflow else task.verify(policy.sample(task.prompt,greedy=args.greedy and args.command!="screen",input_limit=16384).text)
-            successes.append(int(value))
-        row={**record,"input_overflow":overflow,"model":cfg["model"],"revision":cfg["revision"]}
-        row.update({("screening_outcomes" if args.command=="screen" else "outcomes"):successes})
-        if args.command=="screen": row["screening_successes"]=sum(successes)
-        outcomes.append(row)
-    write_jsonl(args.output,outcomes)
-    policy.synchronize();elapsed=time.perf_counter()-begin
-    if args.command=="screen":
-        write_jsonl(Path(args.output).with_suffix(".hard.jsonl"),[x for x in outcomes if x["screening_successes"]==0])
-        scores={"hard_count":sum(x["screening_successes"]==0 for x in outcomes)}
-    else:
-        ks=[1] if args.greedy else [k for k in [1,4,8,16,24,32,64,128] if k<=n]
-        scores={f"pass@{k}":(sum(pass_at_k(n,sum(x["outcomes"]),k) for x in outcomes)/len(outcomes) if outcomes else None) for k in ks}
-    summary={**scores,"examples":len(outcomes),"samples":n,"input_overflow":sum(x["input_overflow"] for x in outcomes),
-        "wall_seconds":elapsed,"gpu_seconds":elapsed*policy.gpu_count,
-        "cost_role":"shared_training_preparation" if args.command=="screen" and all(r.get("split") in {"train","dev"} for r in records) else "evaluation_only"}
-    Path(args.output).with_suffix(".summary.json").write_text(json.dumps(summary,indent=2)+"\n")
-    print(summary)
+        report.update(model=cfg["model"],revision=cfg["revision"],domain=cfg["domain"],
+            diagnostic_ids=[r["id"] for r in pool],diagnostic_prompt_hashes=[digest(r["prompt"]) for r in pool],
+            calibration_gpu_seconds=ledger.total+trajectory_cost)
+        atomic_json(path,report);print({"selected_layer":report["layer"]});return
+    if args.command in ("evaluate","screen"):
+        from .evaluation import evaluate
+        cfg["method"]=args.method or ("initial" if not args.checkpoint and not args.initial else cfg.get("method","reprsi"))
+        rows,tasks=load_tasks(args.data,args,cfg,domain,allow_empty=True)
+        if args.initial:
+            policy.load(args.initial);policy.set_reference(file_digest(args.initial))
+        if args.checkpoint:policy.load(args.checkpoint,allow_legacy=args.allow_legacy_checkpoint)
+        checkpoint_id=file_digest(args.checkpoint) if args.checkpoint else (file_digest(args.initial) if args.initial else "initial")
+        print(evaluate(policy,cfg,rows,tasks,args.output,args.samples,args.greedy,args.command=="screen",args.resume,checkpoint_id,args.save_responses));return
+    if args.command=="export-curricula":
+        from .experiments import export_teacher
+        policy.load(args.checkpoint)
+        print(export_teacher(policy,cfg,args.output,args.count,domain,args.resume,file_digest(args.checkpoint),args.sampling_seed));return
+    if args.command=="fresh-student":
+        from .experiments import train_fixed
+        from .curricula import load_frozen
+        records=read_jsonl(args.curricula)
+        if args.supervised and (cfg.get("domain")!="twohop" or any(r.get("split")!="atomic" for r in records)):
+            raise ValueError("Supervised preparation is reserved for the atomic fact partition")
+        if cfg.get("domain")=="twohop":
+            from .mechanism import load_entities
+            tasks=load_entities(records)
+        else:
+            checker=None
+            if any(r.get("kind")=="benchmark_math" for r in records):
+                from .benchmarks import HARPChecker
+                checker=HARPChecker(args.harp_root)
+            tasks=load_frozen(records,domain,checker)
+        stages=None
+        if any("stage" in r for r in records):
+            if any(r.get("stage") not in (0,1,2) for r in records):raise ValueError("Invalid human stage labels")
+            stages=[[t for t,r in zip(tasks,records) if r["stage"]==s] for s in range(3)]
+            if any(not x for x in stages):raise ValueError("All three human stages are required")
+        initial_id="pretrained"
+        if args.initial:
+            policy.load(args.initial);initial_id=file_digest(args.initial);policy.set_reference(initial_id)
+        eval_tasks=None
+        if args.eval_data:
+            rows,eval_tasks=load_tasks(args.eval_data,args,cfg,domain)
+            if any(r.get("split") not in ("test","dev","atomic") for r in rows):raise ValueError("Fresh evaluation partition is invalid")
+        print(train_fixed(policy,cfg,tasks,args.output,args.steps,args.eval_every,eval_tasks,args.resume,
+                          args.supervised,initial_id,args.teacher_id or digest(records),stages));return
+    if args.command=="intervene":
+        from .mechanism import run_interventions
+        if cfg.get("domain")!="twohop":raise ValueError("Use the twohop configuration")
+        print(run_interventions(policy,cfg,args.twohop_data,args.initial,args.output,args.layer,args.seeds,args.steps,args.continuation_steps,args.resume));return
+    if args.command=="prediction-trials":
+        from .mechanism import collect_prediction_trials
+        if cfg.get("domain")!="twohop":raise ValueError("Use the twohop configuration")
+        print(collect_prediction_trials(policy,cfg,args.twohop_data,read_jsonl(args.groups),args.initial,args.output,args.layer,
+              args.trials,args.curriculum_steps,args.continuation_steps,args.resume));return
+    if args.command=="prediction-origins":
+        from .mechanism import prediction_origins
+        if cfg.get("domain")!="twohop":raise ValueError("Use the twohop configuration")
+        print(prediction_origins(policy,cfg,args.twohop_data,args.initial,args.output,args.runs,args.steps,args.resume));return
+    if args.command=="prediction-groups":
+        from .mechanism import prediction_groups
+        if cfg.get("domain")!="twohop":raise ValueError("Use the twohop configuration")
+        origins=read_jsonl(args.origins)
+        for r in origins:
+            r["origin"]=str((Path(args.origins).parent/r["origin"]).resolve())
+        print(prediction_groups(policy,cfg,args.twohop_data,origins,args.output,args.groups_per_run,args.items,args.resume));return
 
 
-if __name__=="__main__": main()
+if __name__=="__main__":main()

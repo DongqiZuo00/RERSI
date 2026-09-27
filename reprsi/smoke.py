@@ -1,8 +1,3 @@
-"""CPU smoke backend: real tiny causal Transformer and RLOO, finite action space.
-
-Only an integration check. Its tokenization, grammar, and learning rates are not
-the experimental protocol. No benchmark claim may be inferred from its outputs.
-"""
 from types import SimpleNamespace
 import json
 import torch
@@ -28,7 +23,7 @@ class TinyTokenizer:
 
     def encode(self,text,**kwargs):
         if text in self.strings: return [259+self.strings.index(text)]
-        return [ord(c)+3 for c in text]  # generated diagnostics and prompts are ASCII
+        return [ord(c)+3 for c in text]  
 
     def __call__(self,text,**kwargs):
         return {"input_ids":self.encode(text),"offset_mapping":[(i,i+1) for i in range(len(text))]}
@@ -56,7 +51,6 @@ class TinyModel(torch.nn.Module):
 class TinyPolicy(Policy):
     def __init__(self,config):
         seed_all(config["seed"]);torch.set_num_threads(1)
-        # Disable fused inference paths so forward hooks and gradients share one path.
         torch.backends.mha.set_fastpath_enabled(False)
         tok=TinyTokenizer(config["items"])
         super().__init__(config,TinyModel(tok.vocab_size),tok,tiny=True)

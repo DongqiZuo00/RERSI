@@ -11,13 +11,17 @@
   "student_steps": 8,
   "prompts_per_step": 8,
   "completions": 4,
-  "teacher_lr": 1e-6,
-  "student_lr": 2e-6,
+  "teacher_lr": 1e-06,
+  "student_lr": 2e-06,
   "kl_coef": 0.01,
   "input_limit": 2048,
   "output_limit": 4096,
   "specs_per_family": 4,
   "target_batch": 256,
   "feedback": "cohesion",
-  "teacher_updates": true
+  "teacher_updates": true,
+  "gradient_checkpointing": true,
+  "monitor_every": 5,
+  "eval_every": 5,
+  "keep_every": 5
 }

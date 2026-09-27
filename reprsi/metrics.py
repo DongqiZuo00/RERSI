@@ -1,4 +1,3 @@
-"""Paper Eqs. (4)-(10), (22)-(25), and (28); independent of model libraries."""
 from collections import defaultdict
 import hashlib
 import math
@@ -11,11 +10,6 @@ def seed_for(root, *parts):
 
 
 def cohesion(hidden, records, eps=1e-8):
-    """Exact state-balanced expectations, then equal family/specification weights.
-
-    A record has family, specification, state, context. No random pair resampling
-    occurs between endpoints. All distinct-context pairs are used within a state.
-    """
     h = np.asarray(hidden, dtype=np.float64)
     if h.ndim != 2 or len(h) != len(records) or not np.isfinite(h).all():
         raise ValueError("Invalid diagnostic representations")
@@ -50,7 +44,6 @@ def cohesion(hidden, records, eps=1e-8):
 
 
 def teacher_rewards(raw, eps=1e-8):
-    """None marks invalid candidates. Return None iff the entire group is invalid."""
     valid = [float(x) for x in raw if x is not None]
     if not valid:
         return None

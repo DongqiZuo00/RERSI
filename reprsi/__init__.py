@@ -1,3 +1,2 @@
-"""Minimal implementation of representation-guided recursive self-improvement."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

@@ -1,4 +1,3 @@
-"""Fixed mathematical teacher interface. Numeric/typing checks also run in builders."""
 import json
 
 EXAMPLES = [

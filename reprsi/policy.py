@@ -1,8 +1,3 @@
-"""Single-device, serial full-parameter RLOO backend with fixed reference policy.
-
-Branches and teacher/student optimizer states are swapped from local checkpoints.
-The reference model remains the initialization. No adapters or representation loss.
-"""
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +6,7 @@ import random
 import numpy as np
 import torch
 from .metrics import rloo
+from .storage import digest
 
 
 @dataclass
@@ -28,12 +24,25 @@ def seed_all(seed):
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
 
 
-def sequence_terms(logits, ref_logits, targets, allowed=None):
-    """Sum log pi(completion) and exact categorical forward KL on sampled prefixes.
+def rng_state():
+    state = np.random.get_state()
+    return {"python": random.getstate(), "numpy": [state[0], state[1].tolist(), *state[2:]],
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []}
 
-    Grammar masks restrict BOTH distributions before softmax. No length averaging
-    of curriculum log probability. Masked entries are gathered out to avoid 0*NaN.
-    """
+
+def restore_rng(state):
+    random.setstate(state["python"])
+    value = state["numpy"]
+    np.random.set_state((value[0], np.array(value[1], dtype=np.uint32), *value[2:]))
+    torch.set_rng_state(state["torch"])
+    if state["cuda"]:
+        if len(state["cuda"]) != torch.cuda.device_count():
+            raise ValueError("Exact RNG restoration requires the original CUDA device count")
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def sequence_terms(logits, ref_logits, targets, allowed=None):
     logprob=logits.new_zeros((),dtype=torch.float32)
     kl=logprob.clone()
     for t, token in enumerate(targets):
@@ -71,6 +80,18 @@ class Policy:
             if isinstance(module,torch.nn.Dropout): module.p=0.0
         self.reference_device=torch.device(config.get("reference_device",str(self.device)))
         self.reference=deepcopy(self.model).to(self.reference_device).eval().requires_grad_(False)
+        self.checkpoint_signature = digest({"model": config["model"], "revision": config["revision"],
+            "parameters": [(n, list(p.shape), str(p.dtype)) for n,p in self.model.named_parameters()],
+            "chat_template": getattr(tokenizer, "chat_template", None)})
+        self.reference_tag = "pretrained"
+        self.gradient_checkpointing = bool(config.get("gradient_checkpointing", False))
+        if self.gradient_checkpointing:
+            if not hasattr(self.model, "gradient_checkpointing_enable"):
+                raise ValueError("This model does not support gradient checkpointing")
+            self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        if config.get("deterministic", False):
+            torch.use_deterministic_algorithms(True)
+            torch.backends.cudnn.benchmark = False
         devices={p.device.index for p in [next(self.model.parameters()),next(self.reference.parameters())] if p.device.type=="cuda"}
         self.gpu_count=len(devices)
         self.optimizer=None
@@ -91,10 +112,8 @@ class Policy:
         self.model.zero_grad(set_to_none=True)
         self.optimizer=None
         self.master_parameters=None
-        self.parameters=list(self.model.parameters())
+        self.parameters=[p for p in self.model.parameters() if p.requires_grad]
         self.has_master=any(p.dtype in (torch.bfloat16,torch.float16) for p in self.parameters)
-        # BF16 forward weights require FP32 master weights: 1e-6 updates can round
-        # to zero if AdamW directly updates BF16 parameters and moment buffers.
         self.master_parameters=([torch.nn.Parameter(p.detach().float().clone()) for p in self.parameters]
             if self.has_master else self.parameters)
         self.optimizer=torch.optim.AdamW(self.master_parameters,lr=lr,betas=(0.9,0.95),eps=1e-8,weight_decay=0.0)
@@ -111,8 +130,6 @@ class Policy:
         return ids
 
     def _grammar(self, schema):
-        # Use the library-neutral API: LMFE 0.11.3's bundled Transformers bridge
-        # imports a tokenizer class removed from transformers.tokenization_utils in v5.
         from lmformatenforcer import JsonSchemaParser,TokenEnforcer,TokenEnforcerTokenizerData
         if self.grammar_data is None:
             tok=self.tokenizer;special=set(tok.all_special_ids)
@@ -141,7 +158,7 @@ class Policy:
         eos_ids=eos if isinstance(eos,list) else [eos]
         options=GenerationConfig(do_sample=not greedy,temperature=1.0,top_p=1.0,top_k=0,
             max_new_tokens=self.config["output_limit"],eos_token_id=eos,
-            pad_token_id=self.tokenizer.pad_token_id or eos_ids[0],repetition_penalty=1.0)
+            pad_token_id=(self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else eos_ids[0]),repetition_penalty=1.0)
         constraint=self._grammar(schema) if schema else None
         with torch.no_grad():
             seq=self.model.generate(input_ids=torch.tensor([ids],device=self.device),
@@ -165,10 +182,9 @@ class Policy:
         return masks
 
     def update(self,rollouts,advantages,lr):
-        """One on-policy update per group; reward advantages are stop-gradient."""
         if len(rollouts)!=len(advantages) or not rollouts: raise ValueError("Invalid update group")
         for group in self.optimizer.param_groups: group["lr"]=lr
-        self.model.eval()  # eval disables dropout, NOT autograd
+        self.model.train(self.gradient_checkpointing)
         self.model.zero_grad(set_to_none=True)
         self.optimizer.zero_grad(set_to_none=True)
         loss_value=0.0
@@ -185,6 +201,10 @@ class Policy:
             if not torch.isfinite(loss): raise FloatingPointError("Non-finite policy loss")
             loss.backward();loss_value+=float(loss.detach())
             del logits,ref,loss,lp,kl
+        norm = self._optimizer_step()
+        return {"loss":loss_value,"grad_norm":norm}
+
+    def _optimizer_step(self):
         if self.has_master:
             for parameter,master in zip(self.parameters,self.master_parameters):
                 master.grad=None if parameter.grad is None else parameter.grad.detach().float()
@@ -194,23 +214,52 @@ class Policy:
         if self.has_master:
             with torch.no_grad():
                 for parameter,master in zip(self.parameters,self.master_parameters):parameter.copy_(master)
-        return {"loss":loss_value,"grad_norm":float(norm)}
+        self.model.eval()
+        return float(norm)
+
+    def train_batch(self, tasks):
+        if not tasks: raise ValueError("Empty training batch")
+        rollouts, advantages, rewards_all = [], [], []
+        for task in tasks:
+            samples = [self.sample(task.prompt) for _ in range(self.config["completions"])]
+            rewards = [task.verify(s.text) for s in samples]
+            if any(x not in (0, 1) for x in rewards): raise ValueError("Verifier must return a binary reward")
+            rollouts.extend(samples); advantages.extend(rloo(rewards)); rewards_all.extend(rewards)
+        stats = self.update(rollouts, advantages, self.config["student_lr"])
+        return {**stats, "reward": float(np.mean(rewards_all)), "answers": len(rewards_all)}
+
+    def train_steps(self, tasks, steps, seed, start=0):
+        if not tasks or steps < 1: raise ValueError("Training needs examples and positive steps")
+        values=[];n=self.config["prompts_per_step"]
+        from .metrics import seed_for
+        for step in range(start, start+steps):
+            seed_all(seed_for(seed, "student_step", step))
+            batch=[tasks[(step*n+i)%len(tasks)] for i in range(n)]
+            values.append(self.train_batch(batch)["reward"])
+        return float(np.mean(values))
 
     def train_curriculum(self,tasks,seed):
         seed_all(seed)
         n=self.config["prompts_per_step"]; steps=self.config["student_steps"]
         if steps*n!=2*len(tasks): raise ValueError("Each ordered curriculum must be traversed twice")
-        total_reward=0.0;answers=0
-        for step in range(steps):
-            batch=[tasks[(step*n+i)%len(tasks)] for i in range(n)]
-            rollouts=[];advantages=[]
-            for task in batch:
-                samples=[self.sample(task.prompt) for _ in range(self.config["completions"])]
-                rewards=[task.verify(s.text) for s in samples]
-                total_reward+=sum(rewards);answers+=len(rewards)
-                rollouts.extend(samples);advantages.extend(rloo(rewards))
-            self.update(rollouts,advantages,self.config["student_lr"])
-        return total_reward/answers
+        return self.train_steps(tasks, steps, seed)
+
+    def supervised_batch(self, tasks):
+        if not tasks: raise ValueError("Empty supervised batch")
+        self.model.train(self.gradient_checkpointing)
+        self.model.zero_grad(set_to_none=True); self.optimizer.zero_grad(set_to_none=True)
+        for group in self.optimizer.param_groups: group["lr"] = self.config["student_lr"]
+        loss_value=0.0
+        for task in tasks:
+            ids=self.encode(task.prompt)
+            target=self.tokenizer.encode(task.answer,add_special_tokens=False)
+            if not target: raise ValueError("Empty atomic answer")
+            x=torch.tensor([ids+target[:-1]],device=self.device)
+            logits=self.model(x,use_cache=False).logits[0,len(ids)-1:].float()
+            loss=torch.nn.functional.cross_entropy(logits,torch.tensor(target,device=self.device))/len(tasks)
+            if not torch.isfinite(loss): raise FloatingPointError("Non-finite supervised loss")
+            loss.backward();loss_value+=float(loss.detach())
+        return {"loss":loss_value,"grad_norm":self._optimizer_step()}
 
     def anchor_input(self,record):
         text=self.chat(record["prompt"])
@@ -240,10 +289,10 @@ class Policy:
                 finally: handle.remove()
         return np.stack(vectors)
 
-    def answer_probability(self,record,answer,layer=None,patch=None):
-        """Full reference-answer sequence probability for semantic patching."""
+    def answer_logprob(self,record,answer,layer=None,patch=None):
         ids,pos=self.anchor_input(record)
-        target=self.tokenizer.encode("\\boxed{"+answer+"}",add_special_tokens=False)
+        rendered=answer if record.get("answer_format")=="entity" else "\\boxed{"+answer+"}"
+        target=self.tokenizer.encode(rendered,add_special_tokens=False)
         if not target: raise ValueError("Empty reference answer")
         handle=None
         if patch is not None:
@@ -257,9 +306,27 @@ class Policy:
                 x=torch.tensor([ids+target[:-1]],device=self.device)
                 logits=self.model(x,use_cache=False).logits[0,len(ids)-1:].float()
                 lp=logits.log_softmax(-1).gather(-1,torch.tensor(target,device=self.device)[:,None]).sum()
-                return float(lp.exp())
+                return float(lp)
         finally:
             if handle: handle.remove()
+
+    def answer_probability(self,record,answer,layer=None,patch=None):
+        return float(np.exp(self.answer_logprob(record,answer,layer,patch)))
+
+    def patched_sample(self, record, layer, patch):
+        _,pos=self.anchor_input(record)
+        def replace(module,args,result):
+            h=result[0] if isinstance(result,tuple) else result
+            if h.shape[1] <= pos: return result  
+            h=h.clone();h[0,pos]=torch.as_tensor(patch,device=h.device,dtype=h.dtype)
+            return (h,)+result[1:] if isinstance(result,tuple) else h
+        handle=self.blocks[layer].register_forward_hook(replace)
+        try: return self.sample(record["prompt"],greedy=True)
+        finally: handle.remove()
+
+    def set_reference(self, tag):
+        self.reference.load_state_dict(self.model.state_dict())
+        self.reference_tag=tag
 
     def save(self,path):
         path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
@@ -270,19 +337,36 @@ class Policy:
             if isinstance(x,tuple): return tuple(cpu(v) for v in x)
             return x
         temporary=path.with_suffix(".tmp")
-        torch.save({"model":cpu(self.model.state_dict()),"optimizer":cpu(self.optimizer.state_dict()),
-            "master_parameters":cpu(self.master_parameters) if self.has_master else None},temporary)
+        signature=digest({"model":self.config["model"],"revision":self.config["revision"],
+            "parameters":[(n,list(p.shape),str(p.dtype)) for n,p in self.model.named_parameters()],
+            "chat_template":getattr(self.tokenizer,"chat_template",None)})
+        torch.save({"format_version":2,"signature":signature,"reference_tag":self.reference_tag,
+            "model":cpu(self.model.state_dict()),"optimizer":cpu(self.optimizer.state_dict()),
+            "rng":rng_state(),"master_parameters":cpu(self.master_parameters) if self.has_master else None},temporary)
         temporary.replace(path)
 
-    def load(self,path):
+    def load(self,path,restore_random=False,allow_legacy=False):
         state=torch.load(path,map_location="cpu",weights_only=True)
+        signature=digest({"model":self.config["model"],"revision":self.config["revision"],
+            "parameters":[(n,list(p.shape),str(p.dtype)) for n,p in self.model.named_parameters()],
+            "chat_template":getattr(self.tokenizer,"chat_template",None)})
+        if state.get("format_version")!=2:
+            if not allow_legacy: raise ValueError("Legacy checkpoint: explicit migration is required")
+        elif state["signature"]!=signature:
+            raise ValueError("Checkpoint backbone, dtype, tokenizer template or shape mismatch")
+        elif state.get("reference_tag")!=self.reference_tag:
+            raise ValueError("Checkpoint KL reference differs; load the common initialization first")
         self.model.load_state_dict(state["model"])
         self.reset_optimizer(self.config["student_lr"])
         if self.has_master:
             if state.get("master_parameters") is None:raise ValueError("BF16 checkpoint is missing FP32 master weights")
+            if len(state["master_parameters"])!=len(self.master_parameters):raise ValueError("Master-weight count mismatch")
             with torch.no_grad():
-                for master,saved in zip(self.master_parameters,state["master_parameters"]):master.copy_(saved)
+                for master,saved in zip(self.master_parameters,state["master_parameters"]):
+                    if master.shape!=saved.shape:raise ValueError("Master-weight shape mismatch")
+                    master.copy_(saved)
         self.optimizer.load_state_dict(state["optimizer"])
+        if restore_random: restore_rng(state["rng"])
         del state
 
     def synchronize(self):

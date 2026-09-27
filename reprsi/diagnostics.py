@@ -1,4 +1,3 @@
-"""Disjoint exact mathematical diagnostics with fixed pre-continuation anchors."""
 from collections import defaultdict
 import json
 import random
@@ -11,19 +10,12 @@ BOUNDARY = "\n\nContinuation: "
 
 
 def make_math_pool(split, specifications=64, seed=2026):
-    """Four families x specifications x four states x four contexts.
-
-    These are deterministic new diagnostic realizations, not the unreleased
-    original manifests. The continuation is recorded for patching calibration.
-    """
     if split not in {"reward", "monitor", "calibration"}:
         raise ValueError("Unknown diagnostic split")
     out=[]
     for family in ("rational", "polynomial", "modular", "linear"):
         for spec in range(specifications):
             rng=random.Random(seed_for(seed,split,family,spec))
-            # Non-overlapping numeric ranges make rendered contexts distinct across
-            # specifications and pool roles, independent of accidental RNG collisions.
             role={"reward":0,"monitor":1,"calibration":2}[split]
             offset=100+role*10000+spec*50+rng.randrange(10)
             denominator=rng.randrange(2,20)
@@ -76,6 +68,7 @@ def make_math_pool(split, specifications=64, seed=2026):
 
 def continuation_value(state, continuation):
     c=continuation
+    if c["kind"]=="lookup":return c["table"][state]
     if c["kind"]=="affine": return state*c["a"]+c["b"]
     if c["kind"]=="poly_eval": return state.subs(Z,c["at"])
     if c["kind"]=="mod_affine": return sp.Integer((int(state)*c["a"]+c["b"])%c["m"])
@@ -88,6 +81,7 @@ def continuation_value(state, continuation):
 
 
 def sample_batch(pool, specs_per_family, seed):
+    if not pool or specs_per_family<1:raise ValueError("Positive diagnostic sample size required")
     groups=defaultdict(lambda:defaultdict(list))
     for r in pool: groups[r["family"]][r["specification"]].append(r)
     rng=random.Random(seed)
@@ -101,6 +95,8 @@ def sample_batch(pool, specs_per_family, seed):
 def validate_pools(pools):
     seen_ids,seen_prompts,seen_specs=set(),set(),set()
     for pool in pools:
+        if not pool:raise ValueError("Empty diagnostic pool")
+        if len({r["split"] for r in pool})!=1:raise ValueError("Mixed diagnostic roles")
         ids={r["id"] for r in pool}
         prompts={r["prompt"] for r in pool}
         specs={r["specification"] for r in pool}
@@ -118,5 +114,10 @@ def read_jsonl(path):
 
 def write_jsonl(path, rows):
     path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
-    with path.open("w",encoding="utf-8") as stream:
-        for row in rows: stream.write(json.dumps(row,ensure_ascii=False)+"\n")
+    temporary=path.with_name(path.name+".tmp")
+    with temporary.open("w",encoding="utf-8") as stream:
+        for row in rows:stream.write(json.dumps(row,ensure_ascii=False,allow_nan=False)+"\n")
+        stream.flush()
+        import os
+        os.fsync(stream.fileno())
+    temporary.replace(path)

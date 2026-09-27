@@ -119,6 +119,7 @@ class StateTests(unittest.TestCase):
         tok.chat_template="{{ messages[0]['content'] }}\nAnswer: "
         model=GPT2LMHeadModel(GPT2Config(vocab_size=len(tok),n_embd=16,n_layer=1,n_head=2,n_positions=256,eos_token_id=0,pad_token_id=1,bos_token_id=None))
         cfg=smoke_config();cfg["output_limit"]=64;cfg["input_limit"]=128
+        cfg["gradient_checkpointing"]=True
         p=Policy(cfg,model,tok)
         schema={"type":"object","properties":{"x":{"type":"string","enum":["a","b"]}},"required":["x"],"additionalProperties":False}
         sample=p.sample("JSON only",schema=schema)
@@ -128,7 +129,6 @@ class StateTests(unittest.TestCase):
         for token,mask in zip(sample.completion_ids,masks):self.assertIn(token,mask)
         result=p.update([sample],[1.0],0.001)
         self.assertGreater(result["grad_norm"],0)
-        # Replay a complete, real four-family curriculum through the production schema.
         completion=tok.encode(json.dumps({"items":EXAMPLES}),add_special_tokens=False)+[tok.eos_token_id]
         fixture=Rollout(tok.encode("JSON only"),completion,"",schema=curriculum_schema(4))
         for token,mask in zip(completion,p._allowed(fixture)):self.assertIn(token,mask)
@@ -158,7 +158,7 @@ class StateTests(unittest.TestCase):
         p=FakePolicy()
         with tempfile.TemporaryDirectory() as output,patch("reprsi.loop.cohesion",lambda x,b:{"phi":x}):
             run(cfg,p,make_math_pool("reward",1),output,0,domain)
-            self.assertEqual(p.value,3) # candidate 2, replicate 0; replicate 1 is 13
+            self.assertEqual(p.value,3) 
             self.assertEqual(p.optimizer_step,1)
             self.assertTrue(all(origin==0 and opt==0 for _,_,_,origin,opt in p.trials))
             for a in range(2):self.assertEqual(len({seed for _,r,seed,_,_ in p.trials if r==a}),1)

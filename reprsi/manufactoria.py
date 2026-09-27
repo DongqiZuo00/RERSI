@@ -1,8 +1,3 @@
-"""Thin adapter to the public DELTA constructors and DSL executor.
-
-External source remains outside this package. No replacement program verifier.
-The pinned adapter revision is an implementation choice: the paper gives no DELTA commit.
-"""
 from collections import defaultdict,deque
 from dataclasses import dataclass
 import itertools
@@ -52,12 +47,15 @@ class Domain:
         root=Path(root)
         revision=subprocess.check_output(["git","-C",str(root),"rev-parse","HEAD"],text=True).strip()
         if revision!=DELTA_REVISION: raise ValueError("DELTA revision differs from tested adapter revision")
+        if subprocess.run(["git","-C",str(root),"diff","--quiet","HEAD","--","manufactoria"]).returncode:
+            raise ValueError("Pinned DELTA source has local modifications")
         sys.path.insert(0,str(root/"manufactoria"))
         from manufactoria_problem_generators import GeneratorRegistry,GeneratorConfig
         from hf_file_wrapper import TrainingFileWrapper
         from utils.manufactoria_parser import create_robot_factory,ParseError
+        GeneratorConfig._config=GeneratorConfig._get_default_config()
+        GeneratorConfig._populate_attributes()
         self.registry=GeneratorRegistry;self.cfg=GeneratorConfig;self.wrapper=TrainingFileWrapper()
-        # Translate the official parser's checked syntax error into a normal invalid answer.
         def parser(text):
             try:return create_robot_factory(text)
             except ParseError as exc:raise ValueError(str(exc)) from exc
@@ -140,6 +138,8 @@ Examples:\n"""+"\n".join(json.dumps(x,separators=(",",":")) for x in examples)
         out=[]
         for row in records:
             formatted=row if "messages" in row else self.wrapper.convert_problem(row)
+            if not formatted.get("id") or not formatted.get("ground_truth") or not formatted.get("messages"):
+                raise ValueError("Released Manufactoria record lacks identity, prompt or tests")
             out.append(FactoryTask(formatted["messages"][0]["content"],formatted["ground_truth"],self.parser,str(formatted["id"])))
         return out
 
@@ -154,7 +154,6 @@ def make_dfa_pool(split,specifications=128,seed=2026):
             word="".join(rng.choices("RB",k=rng.randint(3,9)))
             if family=="HAS": expression=f"(R|B)*{word}(R|B)*"
             else:
-                # Same regular-language grammar as DELTA's concatenated pattern parts.
                 other="".join(rng.choices("RB",k=rng.randint(1,3)))
                 expression=f"({word})+({other})*"
             if expression in used:continue
@@ -162,7 +161,6 @@ def make_dfa_pool(split,specifications=128,seed=2026):
             assigned="reward" if bucket<7 else "monitor" if bucket==7 else "calibration"
             if assigned!=split:continue
             dfa=DFA.from_nfa(NFA.from_regex(expression,input_symbols=set("RB"))).to_complete().minify()
-            # Deterministic BFS identifiers avoid iteration-order-dependent state labels.
             order={dfa.initial_state:0};queue=deque([dfa.initial_state]);transitions={}
             while queue:
                 state=queue.popleft();row={}
