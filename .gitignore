@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+data/
+runs/
+third_party/
+.env
+.env.*
+*.pt
+*.safetensors

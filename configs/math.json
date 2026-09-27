@@ -1,0 +1,23 @@
+{
+  "model": "google/gemma-4-E4B-it",
+  "revision": "ee0ef6023621cff504d758262d4e04895a5af4a2",
+  "device": "cuda",
+  "domain": "math",
+  "seed": 0,
+  "rounds": 100,
+  "candidates": 4,
+  "items": 32,
+  "replicates": 2,
+  "student_steps": 8,
+  "prompts_per_step": 8,
+  "completions": 4,
+  "teacher_lr": 1e-6,
+  "student_lr": 2e-6,
+  "kl_coef": 0.01,
+  "input_limit": 2048,
+  "output_limit": 4096,
+  "specs_per_family": 4,
+  "target_batch": 256,
+  "feedback": "cohesion",
+  "teacher_updates": true
+}
