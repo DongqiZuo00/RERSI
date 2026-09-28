@@ -57,7 +57,7 @@ def common(sub,name):
 
 
 def main():
-    parser=argparse.ArgumentParser(description="RepRSI workflows")
+    parser=argparse.ArgumentParser()
     sub=parser.add_subparsers(dest="command",required=True)
     p=sub.add_parser("experiment");p.add_argument("--spec",required=True);p.add_argument("--resume",action="store_true");p.add_argument("--plan",action="store_true")
     p=sub.add_parser("smoke");p.add_argument("--output",default="runs/smoke");p.add_argument("--resume",action="store_true")
