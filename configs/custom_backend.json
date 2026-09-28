@@ -1,0 +1,7 @@
+{
+  "extends": "math.json",
+  "backend": "custom",
+  "backend_factory": "reprsi.policy:Policy",
+  "domain_factory": null,
+  "task_loader": null
+}

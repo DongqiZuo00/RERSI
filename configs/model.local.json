@@ -1,0 +1,13 @@
+{
+  "extends": "math.json",
+  "model": "${REPRSI_MODEL}",
+  "revision": "main",
+  "device": "cuda:0",
+  "reference_device": "cuda:1",
+  "token_env": null,
+  "local_files_only": false,
+  "backend": "hf",
+  "dtype": "bfloat16",
+  "attn_implementation": "sdpa",
+  "gradient_checkpointing": true
+}

@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import json
 import random
+import os
 import numpy as np
 import torch
 from .metrics import rloo
@@ -19,9 +20,10 @@ class Rollout:
     truncated: bool = False
 
 
-def seed_all(seed):
+def seed_all(seed, policy=None):
     random.seed(seed);np.random.seed(seed);torch.manual_seed(seed)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+    if policy is not None and hasattr(policy,"set_seed"): policy.set_seed(seed)
 
 
 def rng_state():
@@ -68,11 +70,23 @@ class Policy:
         self.tiny=tiny;self.rollout_tokens=0
         if model is None:
             import transformers as tr
-            kw={"revision":config["revision"],"trust_remote_code":False}
-            tokenizer=tr.AutoTokenizer.from_pretrained(config["model"],**kw)
+            kw={"revision":config["revision"],"trust_remote_code":config.get("trust_remote_code",False),
+                "local_files_only":config.get("local_files_only",False)}
+            if config.get("cache_dir"): kw["cache_dir"]=config["cache_dir"]
+            if config.get("token_env"):
+                token=os.environ.get(config["token_env"])
+                if not token: raise ValueError("Model access token environment variable is unset")
+                kw["token"]=token
+            tokenizer=tr.AutoTokenizer.from_pretrained(config.get("tokenizer") or config["model"],
+                **{**kw,"revision":config.get("tokenizer_revision",config["revision"])})
+            if config.get("chat_template_path"):tokenizer.chat_template=Path(config["chat_template_path"]).read_text()
             cfg=tr.AutoConfig.from_pretrained(config["model"],**kw)
-            cls=tr.Gemma4ForCausalLM if cfg.model_type=="gemma4" else tr.AutoModelForCausalLM
-            model=cls.from_pretrained(config["model"],dtype=torch.bfloat16,**kw)
+            name=config.get("model_class") or ("Gemma4ForCausalLM" if cfg.model_type=="gemma4" else "AutoModelForCausalLM")
+            if not hasattr(tr,name): raise ValueError("Transformers does not expose the configured model_class")
+            dtype=config.get("dtype","bfloat16")
+            if dtype not in ("float32","bfloat16","float16"): raise ValueError("Unsupported training dtype")
+            if config.get("attn_implementation"):kw["attn_implementation"]=config["attn_implementation"]
+            model=getattr(tr,name).from_pretrained(config["model"],dtype=getattr(torch,dtype),**kw)
         self.tokenizer=tokenizer
         self.model=model.to(self.device)
         self.model.eval()
@@ -100,7 +114,8 @@ class Policy:
         self.reset_optimizer(config["student_lr"])
 
     def _blocks(self):
-        for path in ("model.layers","model.language_model.layers","transformer.h","layers"):
+        configured=self.config.get("decoder_layers")
+        for path in ([configured] if configured else ("model.layers","model.language_model.layers","transformer.h","layers")):
             obj=self.model
             try:
                 for component in path.split("."): obj=getattr(obj,component)
@@ -121,7 +136,7 @@ class Policy:
     def chat(self, prompt):
         return self.tokenizer.apply_chat_template([
             {"role":"user","content":prompt}], tokenize=False,
-            add_generation_prompt=True,enable_thinking=False)
+            add_generation_prompt=True,**self.config.get("chat_template_kwargs",{"enable_thinking":False}))
 
     def encode(self, prompt, limit=None):
         ids=self.tokenizer.encode(self.chat(prompt),add_special_tokens=False)
@@ -147,7 +162,7 @@ class Policy:
         enforcer=TokenEnforcer(self.grammar_data,JsonSchemaParser(schema))
         return lambda batch_id,ids:enforcer.get_allowed_tokens(ids.tolist()).allowed_tokens
 
-    def sample(self,prompt,schema=None,greedy=False,input_limit=None):
+    def sample(self,prompt,schema=None,greedy=False,input_limit=None,output_limit=None):
         self.model.eval()
         ids=self.encode(prompt,input_limit)
         if self.tiny:
@@ -157,7 +172,7 @@ class Policy:
         if eos is None: eos=self.tokenizer.eos_token_id
         eos_ids=eos if isinstance(eos,list) else [eos]
         options=GenerationConfig(do_sample=not greedy,temperature=1.0,top_p=1.0,top_k=0,
-            max_new_tokens=self.config["output_limit"],eos_token_id=eos,
+            max_new_tokens=output_limit or (self.config.get("teacher_output_limit",self.config["output_limit"]) if schema else self.config["output_limit"]),eos_token_id=eos,
             pad_token_id=(self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else eos_ids[0]),repetition_penalty=1.0)
         constraint=self._grammar(schema) if schema else None
         with torch.no_grad():
@@ -233,13 +248,13 @@ class Policy:
         values=[];n=self.config["prompts_per_step"]
         from .metrics import seed_for
         for step in range(start, start+steps):
-            seed_all(seed_for(seed, "student_step", step))
+            seed_all(seed_for(seed, "student_step", step),self)
             batch=[tasks[(step*n+i)%len(tasks)] for i in range(n)]
             values.append(self.train_batch(batch)["reward"])
         return float(np.mean(values))
 
     def train_curriculum(self,tasks,seed):
-        seed_all(seed)
+        seed_all(seed,self)
         n=self.config["prompts_per_step"]; steps=self.config["student_steps"]
         if steps*n!=2*len(tasks): raise ValueError("Each ordered curriculum must be traversed twice")
         return self.train_steps(tasks, steps, seed)
@@ -289,7 +304,7 @@ class Policy:
                 finally: handle.remove()
         return np.stack(vectors)
 
-    def answer_logprob(self,record,answer,layer=None,patch=None):
+    def answer_logprob(self,record,answer,layer=None,patch=None,normalize=False):
         ids,pos=self.anchor_input(record)
         rendered=answer if record.get("answer_format")=="entity" else "\\boxed{"+answer+"}"
         target=self.tokenizer.encode(rendered,add_special_tokens=False)
@@ -306,7 +321,7 @@ class Policy:
                 x=torch.tensor([ids+target[:-1]],device=self.device)
                 logits=self.model(x,use_cache=False).logits[0,len(ids)-1:].float()
                 lp=logits.log_softmax(-1).gather(-1,torch.tensor(target,device=self.device)[:,None]).sum()
-                return float(lp)
+                return float(lp/len(target) if normalize else lp)
         finally:
             if handle: handle.remove()
 
@@ -368,6 +383,15 @@ class Policy:
         self.optimizer.load_state_dict(state["optimizer"])
         if restore_random: restore_rng(state["rng"])
         del state
+
+    def set_seed(self, seed):
+        seed_all(seed)
+
+    def hardware_signature(self):
+        devices={str(self.device),str(self.reference_device)}
+        return {"torch":torch.__version__,"cuda":torch.version.cuda,
+            "devices":[torch.cuda.get_device_name(torch.device(x)) if x.startswith("cuda") else x for x in sorted(devices)],
+            "dtype":str(next(self.model.parameters()).dtype),"backend":self.config.get("backend","hf")}
 
     def synchronize(self):
         for device in {self.device,self.reference_device}:

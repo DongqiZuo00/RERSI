@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "model",
+    "revision",
+    "device",
+    "backend",
+    "teacher_output_limit",
+    "output_limit"
+  ],
+  "properties": {
+    "model": {
+      "type": "string"
+    },
+    "revision": {
+      "type": "string"
+    },
+    "tokenizer": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tokenizer_revision": {
+      "type": "string"
+    },
+    "model_class": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "decoder_layers": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "backend": {
+      "enum": [
+        "hf",
+        "tiny",
+        "custom"
+      ]
+    },
+    "backend_factory": {
+      "type": "string"
+    },
+    "domain_factory": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "task_loader": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "device": {
+      "type": "string"
+    },
+    "reference_device": {
+      "type": "string"
+    },
+    "dtype": {
+      "enum": [
+        "float32",
+        "bfloat16",
+        "float16"
+      ]
+    },
+    "token_env": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "local_files_only": {
+      "type": "boolean"
+    },
+    "teacher_output_limit": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "output_limit": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "chat_template_path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "chat_template_kwargs": {
+      "type": "object"
+    },
+    "likelihood_normalization": {
+      "enum": [
+        "mean",
+        "sum"
+      ]
+    },
+    "checker_factory": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

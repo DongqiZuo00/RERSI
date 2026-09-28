@@ -16,11 +16,9 @@ METHODS=("reprsi","matched-search","target","uncertainty","shuffled","prompted",
 
 
 def hardware_signature(policy):
+    if hasattr(policy,"hardware_signature"):return policy.hardware_signature()
     import torch
-    devices={str(policy.device),str(getattr(policy,"reference_device",policy.device))}
-    return {"torch":torch.__version__,"cuda":torch.version.cuda,
-            "devices":[torch.cuda.get_device_name(torch.device(x)) if x.startswith("cuda") else x for x in sorted(devices)],
-            "dtype":str(next(policy.model.parameters()).dtype) if hasattr(policy,"model") else "test_backend"}
+    return {"torch":torch.__version__,"cuda":torch.version.cuda,"devices":[str(policy.device)],"dtype":"test_backend"}
 
 
 class Ledger:
@@ -28,12 +26,14 @@ class Ledger:
         self.policy=policy;self.path=Path(path)
         self.entries=journal(self.path,repair=True)
         self.total=sum(r["gpu_seconds"] for r in self.entries)
+        self.wall=sum(r["wall_seconds"] for r in self.entries)
 
-    def preparation(self,seconds):
+    def preparation(self,seconds,wall_seconds=0.):
         if seconds<0 or not np.isfinite(seconds):raise ValueError("Invalid preparation cost")
         if any(r["stage"]=="shared_preparation" for r in self.entries):return
-        self.total+=seconds
-        row={"stage":"shared_preparation","round":-1,"wall_seconds":0.,"gpu_seconds":seconds,
+        if wall_seconds<0 or not np.isfinite(wall_seconds):raise ValueError("Invalid preparation wall time")
+        self.total+=seconds;self.wall+=wall_seconds
+        row={"stage":"shared_preparation","round":-1,"wall_seconds":wall_seconds,"gpu_seconds":seconds,
              "cumulative_gpu_seconds":self.total,"generated_tokens":0,"complete":True}
         append_json(self.path,row);self.entries.append(row)
 
@@ -46,7 +46,7 @@ class Ledger:
         finally:
             self.policy.synchronize();elapsed=time.perf_counter()-begin
             gpu_seconds=elapsed*getattr(self.policy,"gpu_count",int(self.policy.device.type=="cuda"))
-            self.total+=gpu_seconds
+            self.total+=gpu_seconds;self.wall+=elapsed
             row={"stage":stage,"round":round_index,"wall_seconds":elapsed,"gpu_seconds":gpu_seconds,
                  "cumulative_gpu_seconds":self.total,"generated_tokens":self.policy.rollout_tokens-tokens,"complete":complete}
             append_json(self.path,row);self.entries.append(row)
@@ -98,17 +98,23 @@ def run(config,policy,pool,output,layer,domain=None,target_tasks=None,resume=Fal
             "evaluation":task_fingerprint(eval_tasks or [])}
     with exclusive(output):
         state=RunState(output,policy,config,inputs,resume)
-        ledger=Ledger(policy,Path(output)/"compute.jsonl");ledger.preparation(config.get("preparation_gpu_seconds",0))
+        ledger=Ledger(policy,Path(output)/"compute.jsonl");ledger.preparation(config.get("preparation_gpu_seconds",0),config.get("preparation_wall_seconds",0))
         evaluation_ledger=Ledger(policy,Path(output)/"evaluation_compute.jsonl")
+        if resume:_recover_comparison(state,ledger,config)
+        if not (Path(output)/"comparison_checkpoint.json").exists():
+            _comparison_checkpoint(state,ledger,config)
         if state.completed==0 and not (Path(output)/"initial_metrics.json").exists():
             metrics=_observe(policy,state.student,monitor,layer,0,config,ledger,evaluation_ledger,eval_tasks)
-            atomic_json(Path(output)/"initial_metrics.json",{"completed_rounds":0,"cumulative_gpu_seconds":ledger.total,**metrics})
+            atomic_json(Path(output)/"initial_metrics.json",{"completed_rounds":0,"student_steps":0,"cumulative_gpu_seconds":ledger.total,"cumulative_wall_seconds":ledger.wall,**metrics})
         if method in ("direct","prompted","human"):
             result=_sequential(config,policy,state,domain,target_tasks,ledger,evaluation_ledger,monitor,eval_tasks,layer)
         else:
             result=_recursive(config,policy,state,pool,layer,domain,target_tasks,ledger,evaluation_ledger,monitor,eval_tasks)
         policy.load(state.student);budget=config.get("max_gpu_seconds")
-        result.update(method=method,model=config["model"],revision=config["revision"],seed=config["seed"],
+        comparison=json.loads((Path(output)/"comparison_checkpoint.json").read_text())
+        result.update(comparison_checkpoint=comparison,evaluation_checkpoint="evaluation_student.pt",
+            wall_seconds=ledger.wall,evaluation_wall_seconds=evaluation_ledger.wall,
+            budget_policy="complete_units_last_checkpoint_within_budget",method=method,model=config["model"],revision=config["revision"],seed=config["seed"],
             gpu_seconds=ledger.total,evaluation_gpu_seconds=evaluation_ledger.total,preparation_gpu_seconds=config.get("preparation_gpu_seconds",0),
             max_gpu_seconds=budget,budget_overshoot_seconds=max(0,ledger.total-budget) if budget else 0,
             inputs=inputs,gpu_count=getattr(policy,"gpu_count",0),cost_role="training",
@@ -116,6 +122,45 @@ def run(config,policy,pool,output,layer,domain=None,target_tasks=None,resume=Fal
             unit="round" if method not in ("direct","human") else "student_step")
         atomic_json(Path(output)/"summary.json",result)
         return result
+
+
+def _comparison_checkpoint(state,ledger,config,cost=None):
+    gpu,wall=(ledger.total,ledger.wall) if cost is None else cost
+    budget=config.get("max_gpu_seconds")
+    if budget is not None and gpu>budget:return
+    link_or_copy(state.student,state.output/"evaluation_student.pt")
+    link_or_copy(state.teacher,state.output/"evaluation_teacher.pt")
+    previous=state.current/"record.json"
+    row=json.loads(previous.read_text()) if previous.exists() else {}
+    atomic_json(state.output/"comparison_checkpoint.json",{
+        "completed_rounds":state.completed,"student_steps":row.get("student_steps",0),
+        "gpu_seconds":gpu,"wall_seconds":wall})
+
+
+def _recover_comparison(state,ledger,config):
+    metadata=state.output/"comparison_checkpoint.json"
+    if metadata.exists() and config.get("max_gpu_seconds") is not None:
+        if json.loads(metadata.read_text())["gpu_seconds"]>config["max_gpu_seconds"]:
+            raise ValueError("Resume budget cannot exclude the saved comparison checkpoint")
+    wall=0.;committed=None
+    for entry in ledger.entries:
+        wall+=entry["wall_seconds"]
+        if entry["stage"]=="commit" and entry["round"]==state.completed-1:
+            committed=(entry["cumulative_gpu_seconds"],wall)
+    if committed is not None:
+        row=json.loads((state.current/"record.json").read_text())
+        row.update(cumulative_gpu_seconds=committed[0],cumulative_wall_seconds=committed[1])
+        atomic_json(state.current/"record.json",row)
+        atomic_json(state.output/f"round_{state.completed-1:06d}.json",row)
+        _comparison_checkpoint(state,ledger,config,committed)
+
+
+def _commit(state,ledger,config,teacher,student,row,index):
+    with ledger.charge("commit",index):state.commit(teacher,student,row)
+    row.update(cumulative_gpu_seconds=ledger.total,cumulative_wall_seconds=ledger.wall)
+    atomic_json(state.current/"record.json",row)
+    atomic_json(state.output/f"round_{state.completed-1:06d}.json",row)
+    _comparison_checkpoint(state,ledger,config)
 
 
 def _budget_reached(config,ledger):
@@ -132,7 +177,7 @@ def _recursive(config,policy,state,pool,layer,domain,targets,ledger,eval_ledger,
     student_steps=json.loads(previous.read_text()).get("student_steps",0) if previous.exists() else 0
     for t in range(state.completed,config["rounds"]):
         if _budget_reached(config,ledger):break
-        seed=seed_for(config["seed"],"round",t);seed_all(seed)
+        seed=seed_for(config["seed"],"round",t);seed_all(seed,policy)
         batch=sample_batch(pool,config["specs_per_family"],seed_for(seed,"diagnostic")) if pool else []
         reward_batch=[]
         if method=="target":
@@ -153,7 +198,7 @@ def _recursive(config,policy,state,pool,layer,domain,targets,ledger,eval_ledger,
             with ledger.charge("construction",t):
                 try:
                     if proposal.truncated:raise ValueError("Truncated curriculum")
-                    seed_all(seed_for(config["seed"],"construction",t,k));tasks=builder(proposal.text,config["items"])
+                    seed_all(seed_for(config["seed"],"construction",t,k),policy);tasks=builder(proposal.text,config["items"])
                     if any(x.prompt in reserved for x in tasks):raise ValueError("Diagnostic item reused for training")
                     for task in tasks:policy.encode(task.prompt)
                 except (ValueError,TypeError,KeyError,IndexError,ZeroDivisionError,RecursionError) as exc:
@@ -161,7 +206,7 @@ def _recursive(config,policy,state,pool,layer,domain,targets,ledger,eval_ledger,
             uncertainty=None
             if method=="uncertainty":
                 with ledger.charge("uncertainty_estimation",t):
-                    policy.load(state.student);seed_all(seed_for(config["seed"],"uncertainty",t))
+                    policy.load(state.student);seed_all(seed_for(config["seed"],"uncertainty",t),policy)
                     frequencies=[np.mean([task.verify(policy.sample(task.prompt).text) for _ in range(4)]) for task in tasks]
                     uncertainty=float(np.mean([4*p*(1-p) for p in frequencies]))
             changes=[];training=[]
@@ -198,7 +243,7 @@ def _recursive(config,policy,state,pool,layer,domain,targets,ledger,eval_ledger,
              "selected_replicate":0 if chosen is not None else None,"teacher_update":teacher_stats,"candidates":details,
              "cumulative_gpu_seconds":ledger.total,"student_steps":student_steps,
              "trial_steps_this_round":sum(v is not None for v in raw)*config["replicates"]*config["student_steps"],**observation}
-        with ledger.charge("commit",t):state.commit(teacher,student,row)
+        _commit(state,ledger,config,teacher,student,row,t)
         print(f"round={t} method={method} selected={chosen} rewards={raw}",flush=True)
     return {"completed_rounds":state.completed,"stop_reason":"budget" if _budget_reached(config,ledger) else "round_limit"}
 
@@ -215,7 +260,7 @@ def _sequential(config,policy,state,domain,targets,ledger,eval_ledger,monitor,ev
         observation_config["monitor_every"]=config.get("monitor_every",5)*config["student_steps"]
     for t in range(state.completed,limit):
         if _budget_reached(config,ledger):break
-        seed=seed_for(config["seed"],"sequential",t);seed_all(seed);detail={}
+        seed=seed_for(config["seed"],"sequential",t);seed_all(seed,policy);detail={}
         with ledger.charge("curriculum_preparation",t):
             if method=="prompted":
                 policy.load(state.teacher)
@@ -246,6 +291,6 @@ def _sequential(config,policy,state,domain,targets,ledger,eval_ledger,monitor,ev
                 student_steps+=config["student_steps"] if method=="prompted" else 1
         observation=_observe(policy,student,monitor,layer,t+1,observation_config,ledger,eval_ledger,eval_tasks)
         row={"round":t,"student_steps":student_steps,"cumulative_gpu_seconds":ledger.total,"method":method,"details":detail,**observation}
-        with ledger.charge("commit",t):state.commit(state.teacher,student,row)
+        _commit(state,ledger,config,state.teacher,student,row,t)
         print(f"unit={t} method={method} valid={bool(tasks)}",flush=True)
     return {"completed_rounds":state.completed,"stop_reason":"budget" if _budget_reached(config,ledger) else "unit_limit"}

@@ -68,7 +68,7 @@ def evaluate(policy, config, records, tasks, output, samples=32, greedy=False,
                 if key in seen: continue
                 purpose="screening" if screening else "final_evaluation"
                 seed=seed_for(2026 if screening else config["seed"],purpose,config["model"],task.identity,sample)
-                seed_all(seed);policy.synchronize();begin=time.perf_counter();before_tokens=policy.rollout_tokens
+                seed_all(seed,policy);policy.synchronize();begin=time.perf_counter();before_tokens=policy.rollout_tokens
                 rollout=None
                 if not overflow:
                     rollout=policy.sample(task.prompt,greedy=greedy,input_limit=16384)

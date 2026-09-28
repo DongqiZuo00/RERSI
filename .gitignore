@@ -9,3 +9,7 @@ third_party/
 .env.*
 *.pt
 *.safetensors
+.DS_Store
+.venv/
+.env
+*.egg-info/

@@ -8,13 +8,13 @@ from .tasks import build_curriculum
 from .curricula import task_record
 from .diagnostics import write_jsonl
 from .evaluation import greedy_score,task_fingerprint
-from .loop import Ledger
+from .loop import Ledger,_commit
 
 
 def export_teacher(policy,config,output,count=32,domain=None,resume=False,checkpoint_id="initial",sampling_seed=2027):
     if count<1:raise ValueError("Positive curriculum count required")
     path=Path(output);directory=path.with_suffix(".state")
-    signature=digest({"config":{k:config[k] for k in ("model","revision","domain","items","input_limit","output_limit")},
+    signature=digest({"config":config,
                       "checkpoint":checkpoint_id,"count":count,"seed":sampling_seed})
     with exclusive(directory):
         metadata=directory/"protocol.json"
@@ -31,7 +31,7 @@ def export_teacher(policy,config,output,count=32,domain=None,resume=False,checkp
         schema=domain.curriculum_schema(config["items"]) if domain else curriculum_schema(config["items"])
         for attempt in range(len(saved),count*20):
             if len(valid)>=count:break
-            seed_all(seed_for(sampling_seed,"curriculum_export",attempt))
+            seed_all(seed_for(sampling_seed,"curriculum_export",attempt),policy)
             with ledger.charge("frozen_teacher_generation",attempt):
                 proposal=policy.sample(prompt,schema=schema)
                 row={"attempt":attempt,"specification":proposal.text,"truncated":proposal.truncated}
@@ -49,7 +49,8 @@ def export_teacher(policy,config,output,count=32,domain=None,resume=False,checkp
         rows=[{**task,"curriculum":i,"position":j} for i,row in enumerate(valid) for j,task in enumerate(row["tasks"])]
         write_jsonl(path,rows)
         summary={"curricula":count,"examples":len(rows),"seed":sampling_seed,"teacher_checkpoint":checkpoint_id,
-                 "teacher_seed":config["seed"],"task_digest":digest(rows),"gpu_seconds":ledger.total,"cost_role":"fresh_curriculum_preparation"}
+                 "teacher_seed":config["seed"],"task_digest":digest(rows),"gpu_seconds":ledger.total,
+                 "wall_seconds":ledger.wall,"cost_role":"fresh_curriculum_preparation"}
         atomic_json(path.with_suffix(".summary.json"),summary)
         return summary
 
@@ -68,7 +69,7 @@ def train_fixed(policy,config,tasks,output,steps=800,eval_every=40,eval_tasks=No
             with eval_ledger.charge("heldout_greedy",0):metric=greedy_score(policy,eval_tasks)
             atomic_json(Path(output)/"initial_metrics.json",{"student_steps":0,"evaluation":metric})
         for step in range(state.completed,steps):
-            seed_all(seed_for(config["seed"],"fresh_student_step",step))
+            seed_all(seed_for(config["seed"],"fresh_student_step",step),policy)
             current=tasks;local_step=step
             if stages:
                 stage=min(2,step*3//steps);current=stages[stage];local_step=step-(stage*steps+2)//3
@@ -81,10 +82,11 @@ def train_fixed(policy,config,tasks,output,steps=800,eval_every=40,eval_tasks=No
             row={"student_steps":step+1,"training":stats,"cumulative_gpu_seconds":ledger.total}
             if eval_tasks and ((step+1)%eval_every==0 or step+1==steps):
                 with eval_ledger.charge("heldout_greedy",step+1):row["evaluation"]=greedy_score(policy,eval_tasks)
-            with ledger.charge("commit",step):state.commit(state.teacher,destination,row)
+            _commit(state,ledger,cfg,state.teacher,destination,row,step)
         policy.load(state.student)
         result={"steps":state.completed,"student_seed":config["seed"],"teacher_id":teacher_id,"inputs":inputs,
-                "gpu_seconds":ledger.total,"evaluation_gpu_seconds":eval_ledger.total,"supervised":supervised,
-                "model":config["model"],"revision":config["revision"]}
+                "gpu_seconds":ledger.total,"wall_seconds":ledger.wall,"evaluation_gpu_seconds":eval_ledger.total,"supervised":supervised,
+                "model":config["model"],"revision":config["revision"],
+                "cost_role":"shared_training_preparation" if supervised else "fresh_student_training"}
         atomic_json(Path(output)/"summary.json",result)
         return result

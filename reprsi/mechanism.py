@@ -91,6 +91,13 @@ class TwoHopDomain:
         if any(x not in self.lookup for x in obj["items"]):raise ValueError("Two-hop curriculum includes a reserved query")
         return load_entities([self.lookup[x] for x in obj["items"]])
 
+    def human_curriculum(self,count,seed,stage):
+        if stage not in (0,1,2) or count<1:raise ValueError("Invalid staged curriculum")
+        limit=(8,16,32)[stage]
+        rows=[r for r in self.rows if int(r["next_relation"][1:])<limit]
+        rng=np.random.default_rng(seed)
+        return load_entities([rows[int(i)] for i in rng.choice(len(rows),count,replace=count>len(rows))])
+
     def fixed_calibration_curriculum(self,count,seed):
         rng=np.random.default_rng(seed);indices=rng.choice(len(self.rows),count,replace=count>len(self.rows))
         return load_entities([self.rows[int(i)] for i in indices])
@@ -186,100 +193,18 @@ def run_interventions(policy,config,root,initial,output,layer,seeds=range(5),ste
 
 
 def collect_prediction_trials(policy,config,root,groups,initial,output,layer,trials=5,curriculum_steps=150,continuation_steps=400,resume=False):
-    root=Path(root);domain=TwoHopDomain(root);diagnostics=read_jsonl(root/"reward.jsonl")
-    targets=load_entities(read_jsonl(root/"train.jsonl"));test=load_entities(read_jsonl(root/"test.jsonl"))
-    local=[EntityTask(r["id"],r["local_prompt"],r["state"]) for r in diagnostics]
-    policy.reference_tag="pretrained";policy.load(initial);policy.set_reference(file_digest(initial))
-    if not groups or len({(g["run"],g["group"]) for g in groups})!=len(groups):raise ValueError("Empty or duplicate prediction groups")
-    origin_hashes={p:file_digest(p) for p in {g["origin"] for g in groups}}
-    directory=Path(output);protocol=digest({"groups":[{**g,"origin":origin_hashes[g["origin"]]} for g in groups],
-        "initial":file_digest(initial),"layer":layer,"trials":trials,"curriculum_steps":curriculum_steps,
-        "continuation_steps":continuation_steps,"data":digest(diagnostics)})
-    with exclusive(directory):
-        meta=directory/"protocol.json"
-        if meta.exists():
-            if not resume or json.loads(meta.read_text())["signature"]!=protocol:raise ValueError("Prediction trial protocol changed")
-        else:
-            if resume:raise ValueError("No prediction trials to resume")
-            atomic_json(meta,{"signature":protocol})
-        ledger=Ledger(policy,directory/"compute.jsonl");saved=journal(directory/"trials.jsonl",repair=True)
-        completed={(r["run"],r["group"],r["candidate"],r["trial"]) for r in saved}
-        for group in groups:
-            if len(group["curricula"])!=4:raise ValueError("Prediction group must contain four curricula")
-            if all((group["run"],group["group"],k,a) in completed for k in range(4) for a in range(trials)):continue
-            with ledger.charge("prediction_origin_measurement"):
-                policy.load(group["origin"]);before=cohesion(policy.hidden(diagnostics,layer),diagnostics)["phi"]
-                before_answer=np.mean([policy.answer_logprob(r,r["answer"]) for r in diagnostics])
-                before_state=np.mean([policy.answer_logprob({**r,"prompt":r["local_prompt"],"prefix":r["local_prompt"]},r["state"]) for r in diagnostics])
-            for k,ids in enumerate(group["curricula"]):
-                tasks=domain.build_curriculum(json.dumps({"items":ids}),len(ids));curriculum_digest=digest(ids)
-                for trial in range(trials):
-                    key=(group["run"],group["group"],k,trial)
-                    if key in completed:continue
-                    seed=seed_for(2027,"prediction_trial",group["run"],group["group"],trial)
-                    with ledger.charge("prediction_curriculum_trial"):
-                        policy.load(group["origin"]);policy.train_steps(tasks,curriculum_steps,seed)
-                    with ledger.charge("pre_continuation_features"):
-                        phi=cohesion(policy.hidden(diagnostics,layer),diagnostics)["phi"]
-                        current=100*greedy_score(policy,test)["accuracy"]
-                        curriculum=100*greedy_score(policy,tasks)["accuracy"]
-                        state=100*greedy_score(policy,local)["accuracy"]
-                        answer_ll=np.mean([policy.answer_logprob(r,r["answer"]) for r in diagnostics])
-                        state_ll=np.mean([policy.answer_logprob({**r,"prompt":r["local_prompt"],"prefix":r["local_prompt"]},r["state"]) for r in diagnostics])
-                    policy.reset_optimizer(config["student_lr"])
-                    rng=np.random.default_rng(seed_for(seed,"target_order"));continuation=[targets[int(i)] for i in rng.permutation(len(targets))]
-                    with ledger.charge("prediction_target_continuation"):
-                        policy.train_steps(continuation,continuation_steps,seed_for(seed,"target_training"))
-                    with ledger.charge("post_continuation_measurement"):future=100*greedy_score(policy,test)["accuracy"]
-                    row={"run":key[0],"group":key[1],"candidate":k,"trial":trial,"curriculum_digest":curriculum_digest,
-                        "current_accuracy":current,"curriculum_accuracy":curriculum,"state_accuracy":state,"delta_phi":phi-before,
-                        "answer_logprob_change":float(answer_ll-before_answer),"state_logprob_change":float(state_ll-before_state),
-                        "future_accuracy":future}
-                    append_json(directory/"trials.jsonl",row)
-                    completed.add(key)
-        return {"trials":len(journal(directory/"trials.jsonl")),"gpu_seconds":ledger.total}
+    from .prediction import collect
+    root=Path(root)
+    return collect(policy,config,read_jsonl(root/"reward.jsonl"),load_entities(read_jsonl(root/"train.jsonl")),
+        load_entities(read_jsonl(root/"test.jsonl")),groups,initial,output,layer,TwoHopDomain(root),
+        trials,curriculum_steps,continuation_steps,resume)
 
 
 def prediction_origins(policy,config,root,initial,output,runs=200,steps=400,resume=False):
-    root=Path(root);output=Path(output);train=load_entities(read_jsonl(root/'train.jsonl'))
-    initial_hash=file_digest(initial);rows=[]
-    for run_id in range(runs):
-        policy.reference_tag='pretrained';policy.load(initial);policy.set_reference(initial_hash)
-        rng=np.random.default_rng(seed_for(2027,'origin_order',run_id))
-        tasks=[train[int(i)] for i in rng.permutation(len(train))]
-        directory=output/f'run_{run_id:03d}'
-        train_fixed(policy,{**config,'seed':run_id},tasks,directory,steps,steps,
-                    resume=resume and (directory/'progress.json').exists(),initial_id=initial_hash)
-        rows.append({'run':run_id,'origin':f'run_{run_id:03d}/student.pt','origin_steps':steps})
-        write_jsonl(output/'origins.jsonl',rows)
-    return {'runs':len(rows),'steps':steps}
+    from .prediction import origins
+    return origins(policy,config,load_entities(read_jsonl(Path(root)/"train.jsonl")),initial,output,runs,steps,resume)
 
 
 def prediction_groups(policy,config,root,origins,output,groups_per_run=10,items=100,resume=False):
-    domain=TwoHopDomain(root);directory=Path(output);rows=[]
-    protocol=digest({'origins':[{**r,'origin':file_digest(r['origin'])} for r in origins],
-                     'groups':groups_per_run,'items':items,'model':config['model'],'revision':config['revision']})
-    with exclusive(directory):
-        path=directory/'protocol.json'
-        if path.exists():
-            if not resume or json.loads(path.read_text())['signature']!=protocol:raise ValueError('Prediction generation protocol changed')
-        else:atomic_json(path,{'signature':protocol})
-        saved=journal(directory/'groups.jsonl',repair=True);seen={(r['run'],r['group']) for r in saved}
-        ledger=Ledger(policy,directory/'compute.jsonl');old_limit=policy.config['output_limit']
-        policy.config['output_limit']=4096
-        try:
-            for origin in origins:
-                for group in range(groups_per_run):
-                    if (origin['run'],group) in seen:continue
-                    curricula=[]
-                    with ledger.charge('fixed_curriculum_generation'):
-                        for k in range(4):
-                            seed_all(seed_for(2027,'prediction_generation',origin['run'],group,k))
-                            proposal=policy.sample(domain.teacher_prompt(items),schema=domain.curriculum_schema(items))
-                            if proposal.truncated:raise ValueError('Truncated controlled curriculum; increase the declared generation limit, do not filter groups')
-                            domain.build_curriculum(proposal.text,items)
-                            curricula.append(json.loads(proposal.text)['items'])
-                    row={**origin,'group':group,'curricula':curricula}
-                    append_json(directory/'groups.jsonl',row)
-        finally:policy.config['output_limit']=old_limit
-    return {'groups':len(journal(directory/'groups.jsonl')),'gpu_seconds':ledger.total}
+    from .prediction import generate_groups
+    return generate_groups(policy,config,origins,output,TwoHopDomain(root),groups_per_run,items,resume)

@@ -23,5 +23,12 @@
   "gradient_checkpointing": true,
   "monitor_every": 5,
   "eval_every": 5,
-  "keep_every": 5
+  "keep_every": 5,
+  "teacher_output_limit": 4096,
+  "likelihood_normalization": "mean",
+  "backend": "hf",
+  "dtype": "bfloat16",
+  "attn_implementation": "sdpa",
+  "trust_remote_code": false,
+  "local_files_only": false
 }

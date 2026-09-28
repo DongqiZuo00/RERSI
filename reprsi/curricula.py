@@ -32,6 +32,7 @@ def math_items(count,seed,stage=0):
 
 def human_curriculum(count,seed,stage,domain=None):
     if domain is None:return [construct(x) for x in math_items(count,seed,stage)]
+    if hasattr(domain,"human_curriculum"):return domain.human_curriculum(count,seed,stage)
     rng=random.Random(seed);examples={x["family"]:x for x in domain.example_items()}
     families=("START","APPEND","EXACT") if stage==0 else (("REGEX",) if stage==1 else ("HAS",))
     tasks=[]

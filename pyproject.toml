@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "reprsi-minimal"
-version = "0.2.0"
+version = "0.3.0"
 description = "Representation-guided recursive self-improvement workflows"
 requires-python = ">=3.12"
 dynamic = ["dependencies"]
@@ -14,3 +14,6 @@ dependencies = {file = ["requirements.txt"]}
 
 [tool.setuptools.packages.find]
 include = ["reprsi*"]
+
+[project.scripts]
+reprsi = "reprsi.__main__:main"

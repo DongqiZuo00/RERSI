@@ -56,6 +56,12 @@ class TinyPolicy(Policy):
         super().__init__(config,TinyModel(tok.vocab_size),tok,tiny=True)
 
     def _tiny_sample(self,ids,schema,greedy):
+        item_schema=(schema or {}).get("properties",{}).get("items",{}).get("items",{})
+        if schema and item_schema.get("enum"):
+            choices=item_schema["enum"];count=schema["properties"]["items"]["minItems"]
+            for i in range(3):
+                value=json.dumps({"items":[choices[(j+i)%len(choices)] for j in range(count)]},separators=(",",":"))
+                self.tokenizer.strings[i]=value
         allowed=list(range(259,262)) if schema else list(range(262,self.tokenizer.vocab_size))
         with torch.no_grad():
             logits=self.model(torch.tensor([ids],device=self.device)).logits[0,-1,allowed]
@@ -69,4 +75,9 @@ def smoke_config():
         "rounds":2,"candidates":3,"items":2,"replicates":2,"student_steps":4,
         "prompts_per_step":1,"completions":4,"teacher_lr":0.001,"student_lr":0.002,
         "kl_coef":0.01,"input_limit":8192,"output_limit":1,"seed":0,"specs_per_family":1,
-        "feedback":"cohesion","teacher_updates":True,"domain":"math"}
+        "feedback":"cohesion","teacher_updates":True,"domain":"math","backend":"tiny"}
+
+
+def exact_checker(config, args):
+    from .tasks import Task
+    return lambda response, reference: Task('',reference,'rational').verify(response)

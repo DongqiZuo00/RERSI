@@ -151,3 +151,65 @@ def plot_fresh(report,output):
         axis.plot(steps,mean,label=f"Teacher {teacher}");axis.fill_between(steps,mean-sd,mean+sd,alpha=.15)
     axis.set(xlabel="Student optimizer steps",ylabel="Greedy accuracy (%)",ylim=(0,100))
     axis.legend();fig.tight_layout();fig.savefig(output);plt.close(fig)
+
+
+def efficiency_report(directories, reference_method="target"):
+    runs=[];seen=set();protocol=None
+    for value in directories:
+        directory=Path(value)
+        summary=json.loads((directory/'summary.json').read_text())
+        score=json.loads((directory/'greedy.summary.json').read_text())
+        key=(summary['method'],summary['seed'])
+        if key in seen:raise ValueError('Duplicate method and seed')
+        seen.add(key)
+        current=tuple(score.get(k) for k in ('model','revision','task_digest','benchmark','split','samples','greedy'))
+        if protocol is not None and current!=protocol:raise ValueError('Efficiency evaluation protocols differ')
+        if not score.get('greedy') or score['samples']!=1:raise ValueError('Efficiency requires greedy evaluation')
+        protocol=current
+        points=[]
+        for path in [directory/'initial_metrics.json',*sorted(directory.glob('round_*.json'))]:
+            if not path.exists():continue
+            row=json.loads(path.read_text())
+            if 'evaluation' in row:
+                points.append({'gpu_seconds':row['cumulative_gpu_seconds'],
+                    'wall_seconds':row.get('cumulative_wall_seconds'),
+                    'student_steps':row.get('student_steps',0),'accuracy':100*row['evaluation']['accuracy']})
+        checkpoint=summary.get('comparison_checkpoint',{'gpu_seconds':summary['gpu_seconds'],
+            'wall_seconds':summary.get('wall_seconds'),'student_steps':None})
+        points=[p for p in points if p['gpu_seconds']<=checkpoint['gpu_seconds']]
+        points.append({**checkpoint,'accuracy':100*score['pass@1']})
+        points.sort(key=lambda x:x['gpu_seconds'])
+        runs.append({'method':key[0],'seed':key[1],'score':100*score['pass@1'],
+            'actual_gpu_hours':summary['gpu_seconds']/3600,
+            'actual_wall_hours':summary['wall_seconds']/3600 if summary.get('wall_seconds') is not None else None,
+            'comparison_gpu_hours':checkpoint['gpu_seconds']/3600,
+            'comparison_wall_hours':checkpoint['wall_seconds']/3600 if checkpoint.get('wall_seconds') is not None else None,
+            'overshoot_gpu_hours':summary.get('budget_overshoot_seconds',0)/3600,
+            'comparison_checkpoint':checkpoint,'points':points,'hardware':summary.get('hardware')})
+    reference=[r for r in runs if r['method']==reference_method]
+    if not reference:raise ValueError('Reference method is absent')
+    reference_seeds={r['seed'] for r in reference}
+    target=float(np.mean([r['score'] for r in reference]))
+    by_method=defaultdict(list)
+    for r in runs:
+        crossing=next((p for p in r['points'] if p['accuracy']>=target),None)
+        r['matched_performance']=None if crossing is None else {**crossing,
+            'gpu_hours':crossing['gpu_seconds']/3600,
+            'wall_hours':crossing['wall_seconds']/3600 if crossing.get('wall_seconds') is not None else None}
+        by_method[r['method']].append(r)
+    result={'target_accuracy_percent':target,'reference_method':reference_method,
+            'matching_rule':'first_evaluated_completed_checkpoint_at_or_above_target',
+            'methods':{},'runs':runs}
+    for method,rows in by_method.items():
+        if {r['seed'] for r in rows}!=reference_seeds:raise ValueError('Efficiency seed sets differ')
+        if any(r['hardware']!=reference[0]['hardware'] for r in rows):raise ValueError('Efficiency hardware differs')
+        reached=[r['matched_performance'] for r in rows if r['matched_performance'] is not None]
+        def stats(key):
+            values=[r[key] for r in rows]
+            return None if any(v is None for v in values) else mean_sd(values)
+        result['methods'][method]={**{key:stats(key) for key in ('score','actual_gpu_hours','actual_wall_hours',
+            'comparison_gpu_hours','comparison_wall_hours','overshoot_gpu_hours')},
+            'matched_reached':len(reached),'runs':len(rows),
+            'matched_gpu_hours':mean_sd([r['gpu_hours'] for r in reached]) if len(reached)==len(rows) else None,
+            'matched_wall_hours':mean_sd([r['wall_hours'] for r in reached]) if len(reached)==len(rows) and all(r['wall_hours'] is not None for r in reached) else None}
+    return result

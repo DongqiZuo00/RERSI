@@ -1,0 +1,67 @@
+{
+  "workspace": "../..",
+  "config": "configs/twohop.local.json",
+  "output": "runs/twohop",
+  "benchmark": "twohop",
+  "data": {},
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "rounds": 100,
+  "methods": [
+    "reprsi",
+    "direct",
+    "prompted",
+    "matched-search",
+    "target",
+    "uncertainty",
+    "shuffled",
+    "human"
+  ],
+  "calibration": {
+    "batches": 2,
+    "specs_per_family": 1
+  },
+  "evaluation": {
+    "samples": 32,
+    "hard_samples": 128
+  },
+  "fresh_student": {
+    "enabled": true,
+    "methods": [
+      "reprsi",
+      "target"
+    ],
+    "curricula": 32,
+    "steps": 800,
+    "eval_every": 40,
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ]
+  },
+  "prediction": {
+    "enabled": true,
+    "runs": 200,
+    "origin_steps": 400,
+    "groups_per_run": 10,
+    "items": 100,
+    "trials": 5,
+    "curriculum_steps": 150,
+    "continuation_steps": 400,
+    "teacher_output_limit": 16384
+  },
+  "interventions": {
+    "enabled": true,
+    "steps": 500,
+    "continuation_steps": 400
+  },
+  "atomic_steps": 200
+}
