@@ -60,9 +60,15 @@ def main():
     parser=argparse.ArgumentParser()
     sub=parser.add_subparsers(dest="command",required=True)
     p=sub.add_parser("experiment");p.add_argument("--spec",required=True);p.add_argument("--resume",action="store_true");p.add_argument("--plan",action="store_true")
+    p.add_argument("--profile",choices=["full","smoke"],default="full")
+    p=sub.add_parser("download-data");p.add_argument("--benchmark",required=True);p.add_argument("--output",required=True)
+    p.add_argument("--manifest");p.add_argument("--cache")
+    p=sub.add_parser("setup-dependency");p.add_argument("--name",choices=["HARP","DELTA"],required=True);p.add_argument("--output",required=True)
+    p=sub.add_parser("subset-data");p.add_argument("--source",required=True);p.add_argument("--output",required=True);p.add_argument("--count",type=int,required=True)
     p=sub.add_parser("smoke");p.add_argument("--output",default="runs/smoke");p.add_argument("--resume",action="store_true")
     p=sub.add_parser("prepare-diagnostics");p.add_argument("--output",default="data/diagnostics")
     p.add_argument("--domain",choices=["math","manufactoria"],default="math");p.add_argument("--seed",type=int,default=2026)
+    p.add_argument("--specs-per-family",type=int)
     for command in ("prepare-math","prepare-harp"):
         p=sub.add_parser(command);p.add_argument("--source",required=True);p.add_argument("--output",required=True)
     p=sub.add_parser("prepare-manufactoria");p.add_argument("--source",required=True);p.add_argument("--output",required=True)
@@ -105,10 +111,22 @@ def main():
     p.add_argument("--steps",type=int,default=400)
     p=common(sub,"prediction-groups");p.add_argument("--teacher-output-limit",type=int);p.add_argument("--origins",required=True);p.add_argument("--groups-per-run",type=int,default=10)
     p.add_argument("--items",type=int,default=100)
+    p.add_argument("--max-attempts",type=int,default=20)
     args=parser.parse_args()
     if args.command=="experiment":
         from .workflow import execute
-        print(json.dumps(execute(args.spec,args.resume,args.plan),indent=2));return
+        print(json.dumps(execute(args.spec,args.resume,args.plan,args.profile),indent=2));return
+    if args.command=="download-data":
+        from .datasets import download
+        print(download(args.benchmark,args.output,args.manifest,args.cache));return
+    if args.command=="setup-dependency":
+        from .datasets import setup_dependency
+        print(setup_dependency(args.name,args.output));return
+    if args.command=="subset-data":
+        if args.count<1:raise ValueError("Positive subset size required")
+        rows=read_jsonl(args.source)
+        rows=sorted(rows,key=lambda r:seed_for(2026,"smoke_subset",r["id"]))[:args.count]
+        write_jsonl(args.output,rows);print({"examples":len(rows)});return
     if args.command=="smoke":
         from .smoke import TinyPolicy,smoke_config
         from .loop import run
@@ -118,6 +136,9 @@ def main():
         if args.domain=="manufactoria":
             from .manufactoria import make_dfa_pool
             maker=make_dfa_pool;counts=[128,32,8]
+        if args.specs_per_family is not None:
+            if args.specs_per_family<1:raise ValueError("Positive diagnostic size required")
+            counts=[args.specs_per_family]*3
         pools=[maker(split,count,args.seed) for split,count in zip(["reward","monitor","calibration"],counts)]
         validate_pools(pools)
         for split,pool in zip(["reward","monitor","calibration"],pools):write_jsonl(Path(args.output)/(split+".jsonl"),pool)
@@ -125,17 +146,10 @@ def main():
         print({"counts":list(map(len,pools)),"domain":args.domain});return
     if args.command in ("prepare-math","prepare-harp"):
         from .benchmarks import prepare_math,prepare_harp
-        (prepare_math if args.command=="prepare-math" else prepare_harp)(args.source,args.output);return
+        print((prepare_math if args.command=="prepare-math" else prepare_harp)(args.source,args.output));return
     if args.command=="prepare-manufactoria":
-        from .manufactoria import Domain,FAMILIES
-        domain=Domain(args.delta_root);records=read_jsonl(args.source);tasks=domain.load_released_tasks(records)
-        for row in records:
-            family=row.get("problem_family") or row.get("problem_type") or row.get("pattern_type") or row.get("family")
-            if family not in (args.family,FAMILIES[args.family]):raise ValueError("Released family metadata does not match --family")
-        from .curricula import task_record
-        rows=[{**task_record(t),"split":args.split,"benchmark":"Manufactoria-"+args.family,"family":args.family} for t in tasks]
-        if len({r["id"] for r in rows})!=len(rows):raise ValueError("Duplicate released Manufactoria identity")
-        write_jsonl(args.output,rows);print({"examples":len(rows)});return
+        from .manufactoria import Domain,prepare_released
+        print(prepare_released(args.source,args.output,args.split,args.family,Domain(args.delta_root)));return
     if args.command=="prepare-twohop":
         from .mechanism import prepare_twohop,exposure_report
         print(prepare_twohop(args.output));print(exposure_report(args.output));return
@@ -351,7 +365,7 @@ def main():
         origins=read_jsonl(args.origins)
         for r in origins:
             r["origin"]=str((Path(args.origins).parent/r["origin"]).resolve())
-        print(generate_groups(policy,cfg,origins,args.output,domain,args.groups_per_run,args.items,args.resume));return
+        print(generate_groups(policy,cfg,origins,args.output,domain,args.groups_per_run,args.items,args.resume,args.max_attempts));return
 
 
 if __name__=="__main__":main()

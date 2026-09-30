@@ -10,12 +10,25 @@ PRIMES = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31}
 
 
 def final_box(text):
-    start = text.rfind("\\boxed{")
-    if start < 0:
+    matches = list(re.finditer(r"\\boxed(?![A-Za-z])\s*", text))
+    if not matches:
         return None
-    start += len("\\boxed{")
+    start = matches[-1].end()
+    if start >= len(text):
+        return None
+    if text[start] != "{":
+        token = re.match(r"\\[A-Za-z]+|\\[^A-Za-z]|[^\s$}\\]", text[start:])
+        return token.group() if token else None
+    start += 1
     depth = 1
+    escaped = False
     for i in range(start, len(text)):
+        if escaped:
+            escaped = False
+            continue
+        if text[i] == "\\":
+            escaped = True
+            continue
         depth += (text[i] == "{") - (text[i] == "}")
         if depth == 0:
             return text[start:i].strip()

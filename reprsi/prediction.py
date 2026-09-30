@@ -42,8 +42,9 @@ def origins(policy, config, targets, initial, output, runs=200, steps=400, resum
     return {'runs':len(rows),'steps':steps}
 
 
-def generate_groups(policy, config, source_origins, output, domain=None, groups_per_run=10, items=100, resume=False):
+def generate_groups(policy, config, source_origins, output, domain=None, groups_per_run=10, items=100, resume=False, max_attempts=20):
     if not source_origins or groups_per_run<1 or items<1:raise ValueError('Positive group count and curriculum size required')
+    if type(max_attempts) is not int or max_attempts<1:raise ValueError('Positive max_attempts required')
     if len({r['run'] for r in source_origins})!=len(source_origins):raise ValueError('Duplicate origin run')
     directory=Path(output)
     protocol=digest({'origins':[{**r,'origin':file_digest(r['origin'])} for r in source_origins],
@@ -58,21 +59,46 @@ def generate_groups(policy, config, source_origins, output, domain=None, groups_
         elif resume:raise ValueError('No prediction generation to resume')
         else:atomic_json(path,{'signature':protocol})
         saved=journal(directory/'groups.jsonl',repair=True);seen={(r['run'],r['group']) for r in saved}
+        if len(seen)!=len(saved):raise ValueError('Duplicate saved prediction group')
+        attempts=journal(directory/'attempts.jsonl',repair=True);by_candidate={}
+        for row in attempts:
+            key=(row['run'],row['group'],row['candidate'])
+            history=by_candidate.setdefault(key,[])
+            if row['attempt']!=len(history) or any(r['valid'] for r in history):
+                raise ValueError('Invalid prediction generation journal')
+            history.append(row)
         ledger=Ledger(policy,directory/'compute.jsonl')
         for origin in source_origins:
             for group in range(groups_per_run):
                 if (origin['run'],group) in seen:continue
                 curricula=[]
-                with ledger.charge('fixed_curriculum_generation'):
-                    for k in range(4):
-                        seed_all(seed_for(2027,'prediction_generation',origin['run'],group,k),policy)
-                        proposal=policy.sample(prompt,schema=schema)
-                        if proposal.truncated:raise ValueError('Curriculum truncated; increase teacher_output_limit')
-                        tasks=builder(proposal.text,items)
-                        for task in tasks:policy.encode(task.prompt)
-                        curricula.append(json.loads(proposal.text)['items'])
+                for k in range(4):
+                    key=(origin['run'],group,k);history=by_candidate.setdefault(key,[])
+                    if not history or not history[-1]['valid']:
+                        for _ in range(max_attempts):
+                            attempt=len(history);seed=seed_for(2027,'prediction_generation',*key,attempt)
+                            row={'run':key[0],'group':group,'candidate':k,'attempt':attempt,'seed':seed,'valid':False}
+                            seed_all(seed,policy)
+                            with ledger.charge('fixed_curriculum_generation'):
+                                proposal=policy.sample(prompt,schema=schema)
+                                try:
+                                    if proposal.truncated:raise ValueError('Curriculum truncated')
+                                    tasks=builder(proposal.text,items)
+                                    if len(tasks)!=items:raise ValueError('Wrong curriculum length')
+                                    for task in tasks:policy.encode(task.prompt)
+                                    row.update(valid=True,items=json.loads(proposal.text)['items'])
+                                except (ValueError,KeyError,TypeError,IndexError) as exc:
+                                    row['error']=type(exc).__name__+': '+str(exc)
+                            append_json(directory/'attempts.jsonl',row);history.append(row)
+                            if row['valid']:break
+                    if not history[-1]['valid']:
+                        raise ValueError(f'No valid curriculum after {max_attempts} new attempts for {key}; resume to retry')
+                    curricula.append(history[-1]['items'])
                 append_json(directory/'groups.jsonl',{**origin,'group':group,'curricula':curricula})
-        return {'groups':len(journal(directory/'groups.jsonl')),'gpu_seconds':ledger.total}
+                seen.add((origin['run'],group))
+        return {'groups':len(journal(directory/'groups.jsonl')),'attempts':sum(map(len,by_candidate.values())),
+                'invalid_attempts':sum(not r['valid'] for h in by_candidate.values() for r in h),
+                'gpu_seconds':ledger.total,'wall_seconds':ledger.wall}
 
 
 def collect(policy, config, diagnostics, targets, evaluation, groups, initial, output, layer,

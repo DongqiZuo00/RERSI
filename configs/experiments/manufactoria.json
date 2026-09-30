@@ -7,7 +7,9 @@
     "train": "data/manufactoria/train.jsonl",
     "test": "data/manufactoria/test.jsonl",
     "family": "HAS",
-    "delta_root": "third_party/DELTA"
+    "delta_root": "third_party/DELTA",
+    "download": true,
+    "setup_dependencies": true
   },
   "seeds": [
     0,

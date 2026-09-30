@@ -13,6 +13,28 @@ from .metrics import seed_for
 DELTA_REVISION="8500bec984d4a84a4aa94ca3adc31c004aa6a388"
 FAMILIES={"START":"starts_with","APPEND":"append_sequence","EXACT":"exact_sequence",
     "REGEX":"regex_pattern","COMPR":"numerical_comparison","HAS":"contains_substring"}
+RELEASED_FAMILIES={key:{key,value} for key,value in FAMILIES.items()}
+RELEASED_FAMILIES["HAS"].update({"contains_ordered","contains_count"})
+
+
+def prepare_released(source,output,split,family,domain):
+    from .datasets import read_records
+    from .diagnostics import write_jsonl
+    from .curricula import task_record
+    if family not in RELEASED_FAMILIES or split not in ("train","dev","test"):
+        raise ValueError("Invalid Manufactoria partition or family")
+    records=read_records(source)
+    if not records:raise ValueError("Empty released Manufactoria dataset")
+    labels=[r.get("problem_family") or r.get("problem_type") or r.get("pattern_type") or r.get("family") for r in records]
+    if any(label not in RELEASED_FAMILIES[family] for label in labels):
+        raise ValueError("Released family metadata does not match --family")
+    tasks=domain.load_released_tasks(records)
+    if len(tasks)!=len(records):raise ValueError("Released task count changed")
+    rows=[{**task_record(t),"split":split,"benchmark":"Manufactoria-"+family,"family":family,"problem_family":label}
+          for t,label in zip(tasks,labels)]
+    if len({r["id"] for r in rows})!=len(rows):raise ValueError("Duplicate released Manufactoria identity")
+    write_jsonl(output,rows)
+    return {"examples":len(rows),"families":{label:labels.count(label) for label in sorted(set(labels))}}
 
 
 @dataclass

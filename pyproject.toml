@@ -14,5 +14,8 @@ dependencies = {file = ["requirements.txt"]}
 [tool.setuptools.packages.find]
 include = ["reprsi*"]
 
+[tool.setuptools.package-data]
+reprsi = ["dataset_sources.json"]
+
 [project.scripts]
 reprsi = "reprsi.__main__:main"

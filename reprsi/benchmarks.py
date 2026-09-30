@@ -12,13 +12,30 @@ HARP_REVISION="dac2734ff6443bcaf3bbdcb10f13cf21ae9729c2"
 
 
 def prepare_math(root,output):
+    from .datasets import read_records
     root=Path(root)
     def load(split):
         rows=[]
-        for path in sorted((root/split).rglob("*.json")):
-            item=json.loads(path.read_text());answer=final_box(item["solution"])
-            if answer is None: raise ValueError(f"Missing boxed reference: {path.name}")
-            rows.append({"id":path.relative_to(root).as_posix(),"problem":item["problem"],"answer":answer})
+        if root.is_file():
+            records=read_records(root)
+            if any(r.get("split") not in ("train","test") for r in records):
+                raise ValueError("A combined MATH file requires original train/test split labels")
+            sources=[(root,[r for r in records if r["split"]==split])]
+        else:
+            direct=next((p for p in (root/(split+".jsonl"),root/("MATH_"+split+".jsonl"),root/(split+".parquet")) if p.is_file()),None)
+            if direct:sources=[(direct,read_records(direct))]
+            else:
+                paths=sorted(p for p in root.rglob("*") if p.suffix in (".json",".jsonl",".parquet")
+                    and (split in p.relative_to(root).parts[:-1] or p.stem.startswith(split+"-")))
+                sources=[(p,read_records(p)) for p in paths]
+        for path,records in sources:
+            for i,item in enumerate(records):
+                if item.get("split",split)!=split:raise ValueError("MATH source partition mismatch")
+                answer=final_box(item["solution"]) if "solution" in item else item.get("answer")
+                if answer is None:raise ValueError(f"Missing boxed reference: {path.name}:{i}")
+                name=path.relative_to(root).as_posix() if root.is_dir() else path.name
+                identity=item.get("id",name if path.suffix==".json" and len(records)==1 else f"{split}/{name}/{i}")
+                rows.append({"id":str(identity),"problem":item["problem"],"answer":str(answer)})
         return rows
     train,test=load("train"),load("test")
     if len(train)!=7500 or len(test)!=5000: raise ValueError("Expected original MATH: 7500/5000")
@@ -26,6 +43,7 @@ def prepare_math(root,output):
     random.Random(2026).shuffle(train)
     for split,rows in [("train",train[:6750]),("dev",train[6750:]),("test",test)]:
         write_jsonl(Path(output)/f"{split}.jsonl",[{**r,"split":split,"benchmark":"MATH"} for r in rows])
+    return {"train":6750,"dev":750,"test":5000}
 
 
 def prepare_harp(path,output):

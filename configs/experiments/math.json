@@ -5,7 +5,9 @@
   "benchmark": "MATH",
   "data": {
     "source": "data/MATH",
-    "harp_root": "third_party/HARP"
+    "harp_root": "third_party/HARP",
+    "download": true,
+    "setup_dependencies": true
   },
   "seeds": [
     0,

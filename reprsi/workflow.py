@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 import subprocess
 import sys
 from pathlib import Path
@@ -11,13 +12,26 @@ def build(spec, spec_path):
     def path(value):return str((workspace/value).resolve())
     cfg_path=path(spec['config']);cfg=load_config(cfg_path)
     root=Path(path(spec['output']));data=root/'data';diagnostics=root/'diagnostics'
+    if spec.get('config_overrides'):
+        cfg.update(spec['config_overrides']);cfg_path=str(root/'model.json')
     stages=[];domain=cfg.get('domain','math');sources=spec.get('data',{})
     def add(name,args,outputs,resumable=False,marker=None):
         stages.append({'name':name,'argv':list(map(str,args)),'outputs':list(map(str,outputs)),
             'resumable':resumable,'marker':str(marker) if marker else None})
     dep=[]
     for key in ('harp_root','delta_root'):
-        if sources.get(key):dep+=['--'+key.replace('_','-'),path(sources[key])]
+        if sources.get(key):
+            dep+=['--'+key.replace('_','-'),path(sources[key])]
+            if sources.get('setup_dependencies',False):
+                add('setup_'+key,['setup-dependency','--name','HARP' if key=='harp_root' else 'DELTA','--output',path(sources[key])],
+                    [Path(path(sources[key]))/'src' if key=='harp_root' else Path(path(sources[key]))/'manufactoria'])
+    if sources.get('download'):
+        raw=root/'raw';command=['download-data','--benchmark',spec['benchmark'],'--output',raw]
+        if sources.get('manifest'):command+=['--manifest',path(sources['manifest'])]
+        if sources.get('cache'):command+=['--cache',path(sources['cache'])]
+        add('download',command,[raw/'manifest.json'])
+        if domain=='math':sources={**sources,'source':str(raw/'HARP.jsonl') if spec['benchmark']=='HARP' else str(raw)}
+        else:sources={**sources,'train':str(raw/'train.jsonl'),'test':str(raw/'test.jsonl')}
     initial=[];preparation=[]
     if domain=='twohop':
         add('data',['prepare-twohop','--output',data],[data/'definition.json'])
@@ -42,10 +56,21 @@ def build(spec, spec_path):
         else:raise ValueError('Custom domains require data.prepared and diagnostics.prepared')
         prepared=spec.get('diagnostics',{}).get('prepared')
         if prepared:diagnostics=Path(path(prepared))
-        else:add('diagnostics',['prepare-diagnostics','--domain',domain,'--output',diagnostics],
+        else:add('diagnostics',['prepare-diagnostics','--domain',domain,'--output',diagnostics,
+            *(['--specs-per-family',spec['diagnostics']['specs_per_family']] if spec.get('diagnostics',{}).get('specs_per_family') else [])],
             [diagnostics/'reward.jsonl',diagnostics/'monitor.jsonl',diagnostics/'calibration.jsonl'])
+    if spec.get('preflight',True):
+        add('probe',['probe','--config',cfg_path,'--diagnostics',diagnostics/'reward.jsonl','--output',root/'probe',*dep],
+            [root/'probe/probe.json'])
+    if spec.get('data_limit'):
+        subset=root/'subset'
+        for split in ('train','test'):
+            add('subset_'+split,['subset-data','--source',data/(split+'.jsonl'),'--output',subset/(split+'.jsonl'),
+                '--count',spec['data_limit']],[subset/(split+'.jsonl')])
+        data=subset
     train=data/'train.jsonl';test=data/'test.jsonl';hard=None
-    if domain=='math':
+    screening=domain=='math' and not spec.get('smoke',False)
+    if screening:
         for split in ('train','test'):
             out=root/'screening'/(split+'.jsonl')
             add('screen_'+split,['screen','--config',cfg_path,'--data',data/(split+'.jsonl'),'--output',out,*dep],
@@ -71,7 +96,7 @@ def build(spec, spec_path):
         for method in methods:
             out=root/'benchmark'/method/f'seed_{seed}'
             cmd=['train','--config',cfg_path,'--diagnostics',diagnostics/'reward.jsonl','--monitor',diagnostics/'monitor.jsonl',
-                '--calibration',calibration,'--target-train',train,'--eval-data',test,'--seed',seed,'--method',method,
+                '--calibration',calibration,*(['--target-train',train] if not spec.get('smoke',False) else []),'--eval-data',test,'--seed',seed,'--method',method,
                 '--output',out,*initial,*dep]
             if method=='reprsi':cmd+=['--rounds',rounds]
             else:cmd+=['--budget-from',root/'benchmark/reprsi'/f'seed_{seed}'/'summary.json']
@@ -129,13 +154,14 @@ def build(spec, spec_path):
         add('prediction_groups',['prediction-groups','--config',cfg_path,'--origins',orig/'origins.jsonl',
             '--groups-per-run',prediction.get('groups_per_run',10),'--items',prediction.get('items',100),
             '--teacher-output-limit',prediction.get('teacher_output_limit',16384),
+            '--max-attempts',prediction.get('max_attempts',20),
             '--output',groups,*dep],[groups/'groups.jsonl'],True,groups/'protocol.json')
         add('prediction_trials',['prediction-trials','--config',cfg_path,'--groups',groups/'groups.jsonl',
             '--diagnostics',diagnostics/'reward.jsonl','--target-train',train,'--eval-data',test,
             '--calibration',calibration,'--trials',prediction.get('trials',5),'--curriculum-steps',prediction.get('curriculum_steps',150),
             '--continuation-steps',prediction.get('continuation_steps',400),'--output',trials,*initial,*dep],
             [trials/'summary.json'],True,trials/'protocol.json')
-        for likelihood in (False,True):
+        for likelihood in ((False,True) if prediction.get('analyze',True) else ()):
             destination=root/'reports'/('prediction_likelihood.json' if likelihood else 'prediction.json')
             add('prediction_analysis_'+str(likelihood),['analyze-prediction','--data',trials/'trials.jsonl','--output',destination,
                 *(['--likelihood'] if likelihood else [])],[destination])
@@ -149,10 +175,37 @@ def build(spec, spec_path):
     return workspace,root,stages,cfg
 
 
-def execute(spec_path, resume=False, plan=False):
+def smoke_spec(spec):
+    spec=deepcopy(spec);spec['output']=str(Path(spec['output'])/'smoke');spec['smoke']=True
+    spec['seeds']=[0];spec['methods']=['reprsi'];spec['rounds']=1;spec['data_limit']=8;spec['atomic_steps']=2
+    spec['config_overrides']={**spec.get('config_overrides',{}),'rounds':1,'candidates':2,'items':2,
+        'replicates':1,'student_steps':4,'prompts_per_step':1,'completions':2,'specs_per_family':1,
+        'eval_every':1,'monitor_every':1}
+    spec['diagnostics']={**spec.get('diagnostics',{}),'specs_per_family':1}
+    spec['calibration']={'batches':1,'specs_per_family':1,'layers':[0]}
+    spec['evaluation']={'samples':2,'hard_samples':2}
+    spec['fresh_student']={'enabled':True,'methods':['reprsi'],'curricula':1,'steps':2,'eval_every':1,'seeds':[0]}
+    spec['prediction']={'enabled':False};spec['interventions']={'enabled':False}
+    return spec
+
+
+def workload(spec,cfg):
+    prediction=spec.get('prediction',{});branches=0;origins=0
+    if prediction.get('enabled',False):
+        branches=prediction.get('runs',200)*prediction.get('groups_per_run',10)*4*prediction.get('trials',5)
+        origins=prediction.get('runs',200)*prediction.get('origin_steps',400)
+    return {'prediction_trials':branches,'prediction_optimizer_steps':branches*(prediction.get('curriculum_steps',150)+prediction.get('continuation_steps',400)),
+            'prediction_origin_optimizer_steps':origins,'recursive_candidate_optimizer_steps':len(spec.get('seeds',range(5)))*
+            spec.get('rounds',cfg['rounds'])*cfg['candidates']*cfg['replicates']*cfg['student_steps'],
+            'smoke':spec.get('smoke',False)}
+
+
+def execute(spec_path, resume=False, plan=False, profile='full'):
     spec_path=Path(spec_path).resolve();spec=json.loads(spec_path.read_text())
+    if profile not in ('full','smoke'):raise ValueError('Unknown experiment profile')
+    if profile=='smoke':spec=smoke_spec(spec)
     workspace,root,stages,cfg=build(spec,spec_path)
-    if plan:return {'workspace':str(workspace),'output':str(root),'stages':stages,'model':cfg['model'],'backend':cfg.get('backend','hf')}
+    if plan:return {'workspace':str(workspace),'output':str(root),'stages':stages,'model':cfg['model'],'backend':cfg.get('backend','hf'),'workload':workload(spec,cfg)}
     signature=digest({'spec':spec,'config':cfg,'stages':stages})
     with exclusive(root):
         manifest=root/'workflow.json'
@@ -162,6 +215,7 @@ def execute(spec_path, resume=False, plan=False):
         else:
             if resume:raise ValueError('No workflow exists to resume')
             state={'signature':signature,'completed':[]};atomic_json(manifest,state)
+        if spec.get('config_overrides'):atomic_json(root/'model.json',cfg)
         for stage in stages:
             outputs=[Path(p) for p in stage['outputs']]
             if stage['name'] in state['completed']:

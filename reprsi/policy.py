@@ -67,6 +67,10 @@ def sequence_terms(logits, ref_logits, targets, allowed=None):
 class Policy:
     def __init__(self, config, model=None, tokenizer=None, tiny=False):
         self.config=config;self.device=torch.device(config.get("device","cuda"))
+        self.reference_device=torch.device(config.get("reference_device",str(self.device)))
+        for device in (self.device,self.reference_device):
+            if device.type=="cuda" and (not torch.cuda.is_available() or (device.index or 0)>=torch.cuda.device_count()):
+                raise ValueError(f"Configured CUDA device is unavailable: {device}")
         self.tiny=tiny;self.rollout_tokens=0
         if model is None:
             import transformers as tr
@@ -92,7 +96,6 @@ class Policy:
         self.model.eval()
         for module in self.model.modules():
             if isinstance(module,torch.nn.Dropout): module.p=0.0
-        self.reference_device=torch.device(config.get("reference_device",str(self.device)))
         self.reference=deepcopy(self.model).to(self.reference_device).eval().requires_grad_(False)
         self.checkpoint_signature = digest({"model": config["model"], "revision": config["revision"],
             "parameters": [(n, list(p.shape), str(p.dtype)) for n,p in self.model.named_parameters()],

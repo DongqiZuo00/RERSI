@@ -45,7 +45,10 @@ class Ledger:
             complete=True
         finally:
             self.policy.synchronize();elapsed=time.perf_counter()-begin
-            gpu_seconds=elapsed*getattr(self.policy,"gpu_count",int(self.policy.device.type=="cuda"))
+            count=getattr(self.policy,"gpu_count",None)
+            if count is None:count=int(str(self.policy.device).split(":")[0]=="cuda" or getattr(self.policy.device,"type",None)=="cuda")
+            if type(count) is not int or count<0:raise ValueError("gpu_count must be a nonnegative integer")
+            gpu_seconds=elapsed*count
             self.total+=gpu_seconds;self.wall+=elapsed
             row={"stage":stage,"round":round_index,"wall_seconds":elapsed,"gpu_seconds":gpu_seconds,
                  "cumulative_gpu_seconds":self.total,"generated_tokens":self.policy.rollout_tokens-tokens,"complete":complete}
